@@ -1029,13 +1029,14 @@ async function refresh(){try{render(await(await fetch("/api/status")).json())}ca
         const d=await (await fetch('/api/clean?period='+per)).json();
         const rows=(d.rows||[]).filter(w=>w.losses<=tloss);
         let x='';
-        if(d.status==='loading'){x+="<div style='color:var(--muted);margin-bottom:8px'>Рахую… перевірено "+(d.progress||0)+" з "+(d.total||'?')+" гаманців (перший раз може тривати 1–3 хв)</div>"}
+        if(d.status==='loading'){x+="<div style='color:var(--muted);margin-bottom:8px'>Рахую… перевірено "+(d.progress||0)+" з "+(d.total||'?')+" гаманців (результати з'являються по мірі перевірки, повний прохід може тривати до 25 хв)</div>"}
         if(d.status==='error'){x+="<div style='color:var(--down);margin-bottom:8px'>"+esc(d.error||'Помилка')+"</div>"}
         for(const w of rows){
           const c=w.pnl>=0?'var(--up)':'var(--down)';
           x+="<div class='wrow'><div style='display:flex;justify-content:space-between;align-items:center'><span>"+who(w)+"</span><b style='color:"+c+"'>"+(w.pnl>=0?'+':'-')+usd(w.pnl)+"</b></div><div class='sub'>Виграшів "+w.wins+" · програшів "+w.losses+" · позицій "+w.n+"</div></div>";
         }
         if(!rows.length&&d.status!=='loading'&&d.status!=='error')x+="<div style='color:var(--muted)'>Немає гаманців з такою кількістю програшів за цей період</div>";
+        if(d.status==='ready'&&d.partial){x+="<div style='font-size:.72rem;color:var(--muted);margin-top:8px'>Перевірку зупинено за часом: не встигли "+d.partial+" гаманців.</div>"}
         if(d.status==='ready'||(d.rows&&d.rows.length)){
           x+="<div style='font-size:.7rem;color:var(--muted);margin-top:12px;line-height:1.4'>Період: "+(per==='day'?'останні 24 год':'останні 7 днів')+". Перевіряються топ-"+(d.total||40)+" крипто-гаманців за прибутком; враховані закриті позиції"+(d.scope_all?' (всі крипто-ринки: Polymarket не віддав тип ринку)':' на 5-хв ринках BTC/ETH/SOL/XRP')+". Гаманці з надто великою кількістю угод пропущені, бо їх неможливо перевірити повністю"+(d.incomplete?': '+d.incomplete:'')+". Минулі результати не гарантують майбутніх.</div>";
         }
@@ -1508,11 +1509,12 @@ async def api_paper_reset(request):
 
 # ====================== Wallets without losses ======================
 _clean: Dict[str, dict] = {}
-CLEAN_CANDIDATES = 40       # how many top-profit crypto wallets we check
+CLEAN_CANDIDATES = 1000     # how many top-profit crypto wallets we check (1000 = max the leaderboard returns)
 CLEAN_MIN_POSITIONS = 5     # ignore wallets with fewer closed positions in the period
 CLEAN_MAX_PAGES = 6         # pages per wallet and status (200 rows each); beyond that the data is "incomplete"
 CLEAN_WALLET_TIMEOUT = 45   # seconds per wallet; slower ones are skipped
-CLEAN_TTL = 600
+CLEAN_TTL = 1800
+CLEAN_TOTAL_TIMEOUT = 1500   # stop the scan after 25 min and show what we have
 _UPDOWN_RE = re.compile(r"(btc|eth|sol|xrp)-updown-5m-")
 
 
@@ -1568,6 +1570,21 @@ async def _fetch_leaderboard(c: httpx.AsyncClient, period: str, limit: int):
     return [], err
 
 
+async def _get_retry(c: httpx.AsyncClient, url: str, params: dict):
+    """GET with a short back-off when Polymarket answers 429 (rate limited)."""
+    r = None
+    for _ in range(3):
+        r = await c.get(url, params=params)
+        if r.status_code != 429:
+            return r
+        try:
+            wait = float(r.headers.get("Retry-After", 2))
+        except Exception:
+            wait = 2.0
+        await asyncio.sleep(min(max(wait, 1.0), 8.0))
+    return r
+
+
 async def _wallet_window_stats(c: httpx.AsyncClient, wallet: str, since_ts: int):
     """Wins/losses of a wallet on closed 5m crypto positions since since_ts.
     Returns None if data could not be read; 'complete': False if there were too many rows to verify."""
@@ -1584,7 +1601,7 @@ async def _wallet_window_stats(c: httpx.AsyncClient, wallet: str, since_ts: int)
             else:
                 params = {"user": wallet, "status": status, "sort_by": "TIMESTAMP",
                           "sort_direction": "DESC", "limit": 200}
-            r = await c.get("https://data-api.polymarket.com/v2/positions", params=params)
+            r = await _get_retry(c, "https://data-api.polymarket.com/v2/positions", params)
             if r.status_code != 200:
                 return None
             body = r.json()
@@ -1671,15 +1688,22 @@ async def _clean_compute(period: str):
                     return
                 if res["n"] >= CLEAN_MIN_POSITIONS and res["losses"] <= 3:
                     results.append({"wallet": cd["wallet"], "name": cd["name"], **res})
+                    st["rows"] = sorted(results, key=lambda r: r["pnl"], reverse=True)   # show results as they come
+                st["incomplete"] = incomplete
+                st["failed"] = failed
 
-            await asyncio.gather(*[one(cd) for cd in cands])
+            tasks = [asyncio.create_task(one(cd)) for cd in cands]
+            _, pending = await asyncio.wait(tasks, timeout=CLEAN_TOTAL_TIMEOUT)
+            for p in pending:
+                p.cancel()
+            st["partial"] = len(pending)
             results.sort(key=lambda r: r["pnl"], reverse=True)
             st["rows"] = results
             st["incomplete"] = incomplete
             st["failed"] = failed
             st["scope_all"] = scope_all
             st["ts"] = int(datetime.now(timezone.utc).timestamp())
-            if failed == len(cands):
+            if failed and failed == len(cands):
                 st["status"] = "error"
                 st["error"] = "Polymarket не віддав історію позицій гаманців"
             else:
@@ -1699,13 +1723,13 @@ async def api_clean(request):
     st = _clean.get(period)
     if st is None:
         st = _clean[period] = {"status": "loading", "ts": 0, "rows": [], "progress": 0, "total": CLEAN_CANDIDATES,
-                               "incomplete": 0, "failed": 0, "scope_all": False, "error": ""}
+                               "incomplete": 0, "failed": 0, "scope_all": False, "error": "", "partial": 0}
         spawn(_clean_compute(period))
     elif st["status"] != "loading" and now - st["ts"] > (60 if st["status"] == "error" else CLEAN_TTL):
         spawn(_clean_compute(period))
         st["status"] = "loading"
     return JSONResponse({"ok": True, "period": period, **{k: st.get(k) for k in
-                         ("status", "rows", "progress", "total", "incomplete", "failed", "scope_all", "error")}})
+                         ("status", "rows", "progress", "total", "incomplete", "failed", "scope_all", "error", "partial")}})
 
 
 class PasswordMiddleware(BaseHTTPMiddleware):
