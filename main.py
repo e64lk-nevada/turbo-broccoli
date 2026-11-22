@@ -6,6 +6,7 @@ Fallback = Binance
 """
 
 import os
+import re
 import json
 import base64
 import secrets
@@ -841,7 +842,9 @@ h1{font-size:1.15rem;font-weight:700}
 </div>
 <div class="sheet" id="vtop">
   <h3>Найуспішніші трейдери · крипто</h3>
-  <div class="ctabs" id="ttabs"><button data-p="day">Сьогодні</button><button data-p="week">Тиждень</button><button data-p="month">Місяць</button></div>
+  <div class="ctabs" id="tmode"><button data-m="top">Топ прибуток</button><button data-m="clean">Без програшів</button></div>
+  <div class="ctabs" id="lchips" style="display:none;margin-top:8px"><button data-l="0">0 програшів</button><button data-l="1">≤ 1</button><button data-l="2">≤ 2</button><button data-l="3">≤ 3</button></div>
+  <div class="ctabs" id="ttabs" style="margin-top:8px"><button data-p="day">Сьогодні</button><button data-p="week">Тиждень</button><button data-p="month">Місяць</button></div>
   <div class="scroll" id="tbody" style="color:var(--muted);font-size:.85rem;margin-top:10px">Завантаження…</div>
 </div>
 <div class="sheet" id="vpap">
@@ -1009,10 +1012,37 @@ async function refresh(){try{render(await(await fetch("/api/status")).json())}ca
     }catch(e){data={ok:false,error:'Не вдалося завантажити'}}
     draw();
   }
+  let tmode='top',tloss=0,ttimer=null;
   async function loadT(){
-    document.querySelectorAll('#ttabs button').forEach(x=>{x.className=x.dataset.p===tper?'on':''});
+    clearTimeout(ttimer);
+    document.querySelectorAll('#tmode button').forEach(x=>{x.className=x.dataset.m===tmode?'on':''});
+    document.querySelectorAll('#lchips button').forEach(x=>{x.className=(+x.dataset.l===tloss)?'on':''});
+    document.getElementById('lchips').style.display=tmode==='clean'?'flex':'none';
+    document.querySelectorAll('#ttabs button').forEach(x=>{
+      x.className=x.dataset.p===tper?'on':'';
+      x.style.display=(tmode==='clean'&&x.dataset.p==='month')?'none':'';
+    });
     const b=document.getElementById('tbody');
     try{
+      if(tmode==='clean'){
+        const per=tper==='month'?'week':tper;
+        const d=await (await fetch('/api/clean?period='+per)).json();
+        const rows=(d.rows||[]).filter(w=>w.losses<=tloss);
+        let x='';
+        if(d.status==='loading'){x+="<div style='color:var(--muted);margin-bottom:8px'>Рахую… перевірено "+(d.progress||0)+" з "+(d.total||'?')+" гаманців (перший раз до хвилини)</div>"}
+        if(d.status==='error'){x+="<div style='color:var(--down);margin-bottom:8px'>"+esc(d.error||'Помилка')+"</div>"}
+        for(const w of rows){
+          const c=w.pnl>=0?'var(--up)':'var(--down)';
+          x+="<div class='wrow'><div style='display:flex;justify-content:space-between;align-items:center'><span>"+who(w)+"</span><b style='color:"+c+"'>"+(w.pnl>=0?'+':'-')+usd(w.pnl)+"</b></div><div class='sub'>Виграшів "+w.wins+" · програшів "+w.losses+" · позицій "+w.n+"</div></div>";
+        }
+        if(!rows.length&&d.status!=='loading'&&d.status!=='error')x+="<div style='color:var(--muted)'>Немає гаманців з такою кількістю програшів за цей період</div>";
+        if(d.status==='ready'||(d.rows&&d.rows.length)){
+          x+="<div style='font-size:.7rem;color:var(--muted);margin-top:12px;line-height:1.4'>Період: "+(per==='day'?'останні 24 год':'останні 7 днів')+". Перевіряються топ-"+(d.total||40)+" крипто-гаманців за прибутком; враховані закриті позиції"+(d.scope_all?' (всі крипто-ринки: Polymarket не віддав тип ринку)':' на 5-хв ринках BTC/ETH/SOL/XRP')+". Гаманці з надто великою кількістю угод пропущені, бо їх неможливо перевірити повністю"+(d.incomplete?': '+d.incomplete:'')+". Минулі результати не гарантують майбутніх.</div>";
+        }
+        b.innerHTML=x;
+        if(d.status==='loading')ttimer=setTimeout(loadT,3000);
+        return;
+      }
       const r=await fetch('/api/top?period='+tper);
       const d=await r.json();
       if(!d.ok){b.innerHTML=esc(d.error||'Помилка');return}
@@ -1107,7 +1137,7 @@ async function refresh(){try{render(await(await fetch("/api/status")).json())}ca
     document.getElementById('nv2').className=v==='wal'?'on':'';
     document.getElementById('nv3').className=v==='top'?'on':'';
     document.getElementById('nv4').className=v==='pap'?'on':'';
-    clearInterval(timer);
+    clearInterval(timer);clearTimeout(ttimer);
     if(v==='wal'){data=null;draw();load();timer=setInterval(load,5000)}
     else if(v==='top'){loadT();timer=setInterval(loadT,60000)}
     else if(v==='pap'){loadP();timer=setInterval(loadP,4000)}
@@ -1120,6 +1150,8 @@ async function refresh(){try{render(await(await fetch("/api/status")).json())}ca
   document.getElementById('wtabs').onclick=e=>{const s=e.target.dataset&&e.target.dataset.s;if(s){sym=s;data=null;draw();load()}};
   document.getElementById('wsub').onclick=e=>{const t=e.target.dataset&&e.target.dataset.t;if(t){sub=t;draw()}};
   document.getElementById('ttabs').onclick=e=>{const p=e.target.dataset&&e.target.dataset.p;if(p){tper=p;loadT()}};
+  document.getElementById('tmode').onclick=e=>{const mm=e.target.dataset&&e.target.dataset.m;if(mm){tmode=mm;if(mm==='clean'&&tper==='month')tper='day';loadT()}};
+  document.getElementById('lchips').onclick=e=>{const l=e.target.dataset&&e.target.dataset.l;if(l!==undefined&&l!==''){tloss=+l;loadT()}};
 })();
 refresh();setInterval(refresh,2000);
 </script>
@@ -1474,6 +1506,202 @@ async def api_paper_reset(request):
     return JSONResponse(await _paper_payload())
 
 
+# ====================== Wallets without losses ======================
+_clean: Dict[str, dict] = {}
+CLEAN_CANDIDATES = 40       # how many top-profit crypto wallets we check
+CLEAN_MIN_POSITIONS = 5     # ignore wallets with fewer closed positions in the period
+CLEAN_MAX_PAGES = 3         # pages per wallet and status (500 rows each); beyond that the data is "incomplete"
+CLEAN_TTL = 600
+_UPDOWN_RE = re.compile(r"(btc|eth|sol|xrp)-updown-5m-")
+
+
+def _g(t, *keys, default=None):
+    for k in keys:
+        if isinstance(t, dict) and k in t and t[k] is not None:
+            return t[k]
+    return default
+
+
+def _to_ts(v) -> int:
+    if v is None:
+        return 0
+    try:
+        x = int(float(v))
+    except Exception:
+        try:
+            return int(datetime.fromisoformat(str(v).replace("Z", "+00:00")).timestamp())
+        except Exception:
+            return 0
+    return x // 1000 if x > 10**11 else x
+
+
+async def _fetch_leaderboard(c: httpx.AsyncClient, period: str, limit: int):
+    attempts = [
+        ("https://data-api.polymarket.com/v2/leaderboard",
+         {"time_period": period, "category": "crypto", "sort_by": "PNL", "limit": limit}),
+        ("https://data-api.polymarket.com/v1/leaderboard",
+         {"timePeriod": period.upper(), "category": "CRYPTO", "orderBy": "PNL", "limit": limit}),
+    ]
+    err = ""
+    for url, params in attempts:
+        try:
+            r = await c.get(url, params=params)
+            body = r.json()
+        except Exception as e:
+            err = str(e)[:100]
+            continue
+        if r.status_code == 200:
+            data = body.get("data") if isinstance(body, dict) else body
+            if isinstance(data, dict):
+                data = next((v for v in data.values() if isinstance(v, list)), [])
+            if isinstance(data, list):
+                out = []
+                for t in data:
+                    if not isinstance(t, dict):
+                        continue
+                    w = _g(t, "proxy_wallet", "proxyWallet", "address", "wallet", default="")
+                    if w:
+                        out.append({"wallet": w, "name": _g(t, "user_name", "userName", "name", "pseudonym", default="")})
+                return out, ""
+        err = f"{r.status_code} {str(body)[:120]}"
+    return [], err
+
+
+async def _wallet_window_stats(c: httpx.AsyncClient, wallet: str, since_ts: int):
+    """Wins/losses of a wallet on closed 5m crypto positions since since_ts.
+    Returns None if data could not be read; 'complete': False if there were too many rows to verify."""
+    wins = losses = n = 0
+    pnl = 0.0
+    complete = True
+    scope_all = False
+    for status in ("CLOSED", "REDEEMABLE_LOST"):
+        cursor = None
+        pages = 0
+        while True:
+            if cursor:
+                params = {"user": wallet, "cursor": cursor}
+            else:
+                params = {"user": wallet, "status": status, "sort_by": "TIMESTAMP",
+                          "sort_direction": "DESC", "limit": 500}
+            r = await c.get("https://data-api.polymarket.com/v2/positions", params=params)
+            if r.status_code != 200:
+                return None
+            body = r.json()
+            rows = body.get("data") if isinstance(body, dict) else body
+            if not isinstance(rows, list):
+                return None
+            oldest = None
+            for row in rows:
+                ts = _to_ts(_g(row, "last_event_at", "timestamp", "updated_at"))
+                if ts:
+                    oldest = ts if oldest is None else min(oldest, ts)
+                if ts and ts < since_ts:
+                    continue
+                slug = _g(row, "slug", "market_slug", "event_slug", "eventSlug")
+                if slug is not None:
+                    if not _UPDOWN_RE.search(str(slug).lower()):
+                        continue
+                else:
+                    scope_all = True
+                try:
+                    rp = float(_g(row, "realized_pnl", "realizedPnl", default=0) or 0)
+                except Exception:
+                    rp = 0.0
+                n += 1
+                pnl += rp
+                if status == "REDEEMABLE_LOST" or rp < -0.01:
+                    losses += 1
+                elif rp > 0.01:
+                    wins += 1
+            pg = (body.get("pagination") or {}) if isinstance(body, dict) else {}
+            nxt = pg.get("next_cursor")
+            if not rows or not nxt or (oldest is not None and oldest < since_ts):
+                break
+            pages += 1
+            if pages >= CLEAN_MAX_PAGES:
+                complete = False
+                break
+            cursor = nxt
+    return {"wins": wins, "losses": losses, "n": n, "pnl": round(pnl, 2),
+            "complete": complete, "scope_all": scope_all}
+
+
+async def _clean_compute(period: str):
+    st = _clean[period]
+    st["status"] = "loading"
+    st["progress"] = 0
+    st["error"] = ""
+    now = int(datetime.now(timezone.utc).timestamp())
+    since = now - (86400 if period == "day" else 7 * 86400)
+    try:
+        async with httpx.AsyncClient(timeout=12.0) as c:
+            cands, err = await _fetch_leaderboard(c, period, CLEAN_CANDIDATES)
+            if not cands:
+                st["status"] = "error"
+                st["error"] = f"Не вдалося отримати кандидатів: {err}"
+                return
+            st["total"] = len(cands)
+            sem = asyncio.Semaphore(6)
+            results = []
+            incomplete = 0
+            failed = 0
+            scope_all = False
+
+            async def one(cd):
+                nonlocal incomplete, failed, scope_all
+                async with sem:
+                    try:
+                        res = await _wallet_window_stats(c, cd["wallet"], since)
+                    except Exception as e:
+                        logger.warning(f"clean stats {cd['wallet'][:8]}: {e}")
+                        res = None
+                st["progress"] += 1
+                if res is None:
+                    failed += 1
+                    return
+                if res["scope_all"]:
+                    scope_all = True
+                if not res["complete"]:
+                    incomplete += 1
+                    return
+                if res["n"] >= CLEAN_MIN_POSITIONS and res["losses"] <= 3:
+                    results.append({"wallet": cd["wallet"], "name": cd["name"], **res})
+
+            await asyncio.gather(*[one(cd) for cd in cands])
+            results.sort(key=lambda r: r["pnl"], reverse=True)
+            st["rows"] = results
+            st["incomplete"] = incomplete
+            st["failed"] = failed
+            st["scope_all"] = scope_all
+            st["ts"] = int(datetime.now(timezone.utc).timestamp())
+            if failed == len(cands):
+                st["status"] = "error"
+                st["error"] = "Polymarket не віддав історію позицій гаманців"
+            else:
+                st["status"] = "ready"
+    except Exception as e:
+        logger.warning(f"_clean_compute error: {e}")
+        st["status"] = "error"
+        st["error"] = "Помилка під час підрахунку"
+
+
+async def api_clean(request):
+    period = (request.query_params.get("period") or "day").lower()
+    if period not in ("day", "week"):
+        period = "day"
+    now = int(datetime.now(timezone.utc).timestamp())
+    st = _clean.get(period)
+    if st is None:
+        st = _clean[period] = {"status": "loading", "ts": 0, "rows": [], "progress": 0, "total": CLEAN_CANDIDATES,
+                               "incomplete": 0, "failed": 0, "scope_all": False, "error": ""}
+        spawn(_clean_compute(period))
+    elif st["status"] != "loading" and now - st["ts"] > CLEAN_TTL:
+        spawn(_clean_compute(period))
+        st["status"] = "loading"
+    return JSONResponse({"ok": True, "period": period, **{k: st.get(k) for k in
+                         ("status", "rows", "progress", "total", "incomplete", "failed", "scope_all", "error")}})
+
+
 class PasswordMiddleware(BaseHTTPMiddleware):
     """Password for the dashboard (browser login window). Off if DASHBOARD_PASSWORD is not set."""
     async def dispatch(self, request, call_next):
@@ -1498,6 +1726,7 @@ app = Starlette(
         Route("/api/status", api_status),
         Route("/api/trades", api_trades),
         Route("/api/top", api_top),
+        Route("/api/clean", api_clean),
         Route("/api/paper", api_paper),
         Route("/api/paper/config", api_paper_config, methods=["POST"]),
         Route("/api/paper/reset", api_paper_reset, methods=["POST"]),
