@@ -247,6 +247,216 @@ async def fetch_polymarket_close(client: httpx.AsyncClient, symbol: str, start_u
     return None
 
 
+# ====================== Virtual (paper) trading ======================
+PAPER_FILE = os.getenv("PAPER_FILE", "paper_state.json")
+PAPER_FEE_RATE = 0.25      # approx. Polymarket crypto taker fee: fee = shares * 0.25 * (p*(1-p))**2
+PAPER_COINS = ["BTC", "ETH", "SOL", "XRP"]
+
+
+def _paper_default() -> dict:
+    return {
+        "enabled": False,
+        "deposit": 1000.0,
+        "balance": 1000.0,
+        "stake_mode": "pct",      # "pct" = % of balance, "usd" = fixed $
+        "stake_value": 5.0,
+        "coins": {c: True for c in PAPER_COINS},
+        "trades": [],
+        "next_id": 1,
+    }
+
+
+paper: dict = _paper_default()
+
+
+def paper_save():
+    try:
+        tmp = PAPER_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(paper, f)
+        os.replace(tmp, PAPER_FILE)
+    except Exception as e:
+        logger.warning(f"paper save failed: {e}")
+
+
+def paper_load():
+    try:
+        with open(PAPER_FILE) as f:
+            data = json.load(f)
+        base = _paper_default()
+        base.update({k: v for k, v in data.items() if k in base})
+        base["coins"] = {c: bool((data.get("coins") or {}).get(c, True)) for c in PAPER_COINS}
+        paper.clear()
+        paper.update(base)
+        logger.info(f"paper state loaded: balance={paper['balance']:.2f}, trades={len(paper['trades'])}")
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        logger.warning(f"paper load failed: {e}")
+
+
+def _json_list(v):
+    if isinstance(v, str):
+        try:
+            v = json.loads(v)
+        except Exception:
+            return []
+    return v if isinstance(v, list) else []
+
+
+async def paper_market_meta(client: httpx.AsyncClient, slug: str):
+    """(conditionId, {token_id: 'Up'/'Down'}) for a 5m market."""
+    meta = _cid_cache.get(slug)
+    if meta:
+        return meta
+    r = await client.get("https://gamma-api.polymarket.com/events", params={"slug": slug}, timeout=5.0)
+    data = r.json()
+    ev = data[0] if isinstance(data, list) and data else None
+    mk = (ev or {}).get("markets") or []
+    if not mk:
+        return None
+    m0 = mk[0]
+    tokens = _json_list(m0.get("clobTokenIds"))
+    outs = _json_list(m0.get("outcomes"))
+    meta = (m0.get("conditionId"), {str(t): str(o) for t, o in zip(tokens, outs)})
+    if meta[0]:
+        _cid_cache[slug] = meta
+    return meta
+
+
+async def paper_open(client: httpx.AsyncClient, symbol: str, side: str, start_unix: int):
+    """Open a virtual position at the real Polymarket order book (walks the asks)."""
+    coin = symbol.replace("USDT", "")
+    try:
+        if not paper["enabled"] or not paper["coins"].get(coin):
+            return
+        if any(t["status"] == "open" and t["symbol"] == coin and t["window_start"] == start_unix
+               for t in paper["trades"]):
+            return
+        slug = f"{coin.lower()}-updown-5m-{start_unix}"
+        meta = await paper_market_meta(client, slug)
+        if not meta or not meta[0]:
+            logger.warning(f"paper: market not found {slug}")
+            return
+        want = "up" if side == "UP" else "down"
+        token = next((tok for tok, o in meta[1].items() if o.lower() == want), None)
+        if not token:
+            logger.warning(f"paper: token not found {slug}")
+            return
+        r = await client.get("https://clob.polymarket.com/book", params={"token_id": token}, timeout=5.0)
+        book = r.json()
+        asks = []
+        for a in book.get("asks") or []:
+            try:
+                p, sz = float(a["price"]), float(a["size"])
+            except Exception:
+                continue
+            if 0 < p <= 0.99 and sz > 0:
+                asks.append((p, sz))
+        asks.sort()
+        if not asks:
+            logger.info(f"paper: no asks for {coin} {side}, skipped")
+            return
+
+        # state may have changed while we were waiting for the network
+        if not paper["enabled"] or not paper["coins"].get(coin):
+            return
+        bal = paper["balance"]
+        stake = bal * paper["stake_value"] / 100.0 if paper["stake_mode"] == "pct" else paper["stake_value"]
+        stake = min(stake, bal)
+        if stake < 1:
+            logger.info("paper: stake < $1 (balance too low), skipped")
+            return
+
+        remaining, shares, cost = stake, 0.0, 0.0
+        for p, sz in asks:
+            take = min(sz, remaining / p)
+            shares += take
+            cost += take * p
+            remaining -= take * p
+            if remaining < 0.01:
+                break
+        if shares <= 0 or cost < 1:
+            return
+        avg = cost / shares
+        fee = shares * PAPER_FEE_RATE * (avg * (1 - avg)) ** 2
+        total = cost + fee
+        if total > paper["balance"]:
+            k = paper["balance"] / total
+            shares, cost, fee, total = shares * k, cost * k, fee * k, total * k
+        paper["balance"] -= total
+        trade = {
+            "id": paper["next_id"],
+            "ts": int(datetime.now(timezone.utc).timestamp()),
+            "symbol": coin,
+            "side": side,
+            "window_start": start_unix,
+            "entry": round(avg, 4),
+            "shares": round(shares, 4),
+            "cost": round(cost, 2),
+            "fee": round(fee, 4),
+            "status": "open",
+            "pnl": 0.0,
+            "settled_at": None,
+            "balance_after": None,
+        }
+        paper["next_id"] += 1
+        paper["trades"].insert(0, trade)
+        if len(paper["trades"]) > 400:
+            keep_open = [t for t in paper["trades"] if t["status"] == "open"]
+            closed = [t for t in paper["trades"] if t["status"] != "open"][:300]
+            paper["trades"] = sorted(keep_open + closed, key=lambda t: t["id"], reverse=True)
+        paper_save()
+        logger.info(f"PAPER BUY {coin} {side} {shares:.2f} sh @ {avg:.3f} cost ${cost:.2f} fee ${fee:.3f}")
+    except Exception as e:
+        logger.warning(f"paper_open error: {e}")
+
+
+def paper_settle(coin: str, start_unix: int, actual: str) -> bool:
+    for t in paper["trades"]:
+        if t["status"] == "open" and t["symbol"] == coin and t["window_start"] == start_unix:
+            won = t["side"] == actual
+            if won:
+                paper["balance"] += t["shares"]
+                t["pnl"] = round(t["shares"] - t["cost"] - t["fee"], 2)
+                t["status"] = "win"
+            else:
+                t["pnl"] = round(-(t["cost"] + t["fee"]), 2)
+                t["status"] = "loss"
+            t["settled_at"] = int(datetime.now(timezone.utc).timestamp())
+            t["balance_after"] = round(paper["balance"], 2)
+            paper_save()
+            logger.info(f"PAPER {t['status'].upper()} {coin} {t['side']} pnl ${t['pnl']:.2f}")
+            return True
+    return False
+
+
+def paper_void(t: dict):
+    paper["balance"] += t["cost"] + t["fee"]
+    t["status"] = "void"
+    t["pnl"] = 0.0
+    t["settled_at"] = int(datetime.now(timezone.utc).timestamp())
+    t["balance_after"] = round(paper["balance"], 2)
+    paper_save()
+
+
+async def paper_settle_orphans(client: httpx.AsyncClient, symbol: str, start_unix: int):
+    """Settle positions whose window ended but the normal close step missed them (e.g. after a restart)."""
+    coin = symbol.replace("USDT", "")
+    for t in list(paper["trades"]):
+        if t["status"] != "open" or t["symbol"] != coin or t["window_start"] >= start_unix:
+            continue
+        o = await fetch_polymarket_open(client, symbol, t["window_start"])
+        c = await fetch_polymarket_close(client, symbol, t["window_start"])
+        if o is not None and c is not None:
+            paper_settle(coin, t["window_start"], "UP" if c >= o else "DOWN")
+        elif t["window_start"] < start_unix - 1200:
+            paper_void(t)
+
+
+paper_load()
+
+
 # ====================== RTDS Chainlink ======================
 async def rtds_loop():
     """Subscribe to Polymarket RTDS Chainlink prices."""
@@ -343,6 +553,7 @@ async def price_loop():
                         open_p = ws.price_to_beat
                         actual = "UP" if final >= open_p else "DOWN"
                         predicted = ws.last_signal.get("side")
+                        paper_settle(symbol.replace("USDT", ""), prev_start_unix, actual)
                         for h in signal_history:
                             if h.get("window_start") == (ws.window_start.isoformat() if hasattr(ws.window_start, "isoformat") else str(ws.window_start)) and h.get("symbol") == symbol.replace("USDT",""):
                                 h["result"] = "win" if predicted == actual else "loss"
@@ -352,6 +563,7 @@ async def price_loop():
                                 break
 
                     if ws.window_start is None or ws.window_start != window_start:
+                        await paper_settle_orphans(client, symbol, start_unix)
                         # capture open from Chainlink if available, else binance
                         pm_open = await fetch_polymarket_open(client, symbol, start_unix)
                         if pm_open is not None:
@@ -401,6 +613,7 @@ async def price_loop():
                         }
                         ws.last_signal = entry
                         signal_history.insert(0, entry)
+                        asyncio.create_task(paper_open(client, symbol, signal["side"], start_unix))
                         if len(signal_history) > 50:
                             signal_history.pop()
                         logger.info(
@@ -537,6 +750,16 @@ h1{font-size:1.15rem;font-weight:700}
 .wrow a{color:var(--text);text-decoration:none;font-family:ui-monospace,Menlo,monospace}
 .wrow .sub{color:var(--muted);font-size:.74rem;margin-top:2px}
 .sec{font-size:.7rem;letter-spacing:.12em;color:var(--muted);margin:14px 0 4px;text-transform:uppercase}
+.pbtn{background:#1c1c1f;color:var(--muted);border:1px solid var(--border);border-radius:999px;padding:7px 16px;font-size:.8rem;font-weight:700}
+.pbtn.on{color:#0b0b0c;background:var(--up);border-color:var(--up)}
+.inp{background:#1c1c1f;border:1px solid var(--border);color:var(--text);border-radius:10px;padding:10px;font-size:1rem;width:100%;box-sizing:border-box}
+.prow{display:flex;gap:8px;align-items:center;margin:10px 0}
+.prow label{font-size:.78rem;color:var(--muted);min-width:78px}
+.pgrid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.pgrid small{display:block;font-size:.68rem;color:var(--muted)}
+.pgrid b{font-size:1.05rem;font-variant-numeric:tabular-nums}
+.pgo{background:var(--accent);color:#0b0b0c;border:0;border-radius:10px;padding:10px 16px;font-weight:700;font-size:.85rem;white-space:nowrap}
+.pgh{background:#1c1c1f;color:var(--text);border:1px solid var(--border);border-radius:10px;padding:10px 14px;font-size:.8rem;font-weight:600;white-space:nowrap}
 </style>
 </head>
 <body>
@@ -576,7 +799,23 @@ h1{font-size:1.15rem;font-weight:700}
   <div class="ctabs" id="ttabs"><button data-p="day">Сьогодні</button><button data-p="week">Тиждень</button><button data-p="month">Місяць</button></div>
   <div class="scroll" id="tbody" style="color:var(--muted);font-size:.85rem;margin-top:10px">Завантаження…</div>
 </div>
-<nav class="bnav"><button id="nv1" class="on">📈<span>Сигнали</span></button><button id="nv2">🐋<span>Гаманці</span></button><button id="nv3">🏆<span>Трейдери</span></button></nav>
+<div class="sheet" id="vpap">
+  <h3>Віртуальна торгівля (без реальних грошей)</h3>
+  <div class="scroll">
+    <div class="panel">
+      <div class="prow" style="justify-content:space-between"><span>Торгувати віртуально</span><button class="pbtn" id="pen">ВИМК</button></div>
+      <div style="font-size:.72rem;color:var(--muted);margin-bottom:6px">Монети, якими торгувати:</div>
+      <div class="ctabs" id="pcoins"><button data-c="BTC">BTC</button><button data-c="ETH">ETH</button><button data-c="SOL">SOL</button><button data-c="XRP">XRP</button></div>
+      <div class="prow"><label>Ставка</label><select class="inp" id="pmode" style="flex:1.2"><option value="pct">% від балансу</option><option value="usd">$ фіксована</option></select><input class="inp" id="pval" type="number" inputmode="decimal" style="flex:1"></div>
+      <div class="prow"><button class="pgo" id="psave">Зберегти</button><span id="pmsg" style="font-size:.78rem;color:var(--up)"></span></div>
+      <div class="prow" style="margin-top:14px"><label>Депозит $</label><input class="inp" id="pdep" type="number" inputmode="decimal" style="flex:1"><button class="pgh" id="preset">Скинути</button></div>
+      <div style="font-size:.7rem;color:var(--muted)">«Скинути» ставить баланс = депозит і стирає історію віртуальних угод.</div>
+    </div>
+    <div class="panel"><div id="pacc"></div><div id="pspark" style="margin-top:10px"></div></div>
+    <div class="panel"><div class="pt"><span>Віртуальні угоди</span></div><div id="plist"></div></div>
+  </div>
+</div>
+<nav class="bnav"><button id="nv1" class="on">📈<span>Сигнали</span></button><button id="nv2">🐋<span>Гаманці</span></button><button id="nv3">🏆<span>Трейдери</span></button><button id="nv4">💰<span>Віртуал</span></button></nav>
 <script>
 const S=["BTC","ETH","SOL","XRP"];
 function f(n,d=2){return n==null?"—":Number(n).toFixed(d)}
@@ -740,20 +979,83 @@ async function refresh(){try{render(await(await fetch("/api/status")).json())}ca
       b.innerHTML=x||'Поки порожньо';
     }catch(e){b.innerHTML='Не вдалося завантажити'}
   }
+  let pinit=false,pen=false,pcoins={};
+  const money=x=>(x<0?'-':'')+'$'+Math.abs(x).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
+  function drawCfg(){
+    const e=document.getElementById('pen');e.textContent=pen?'УВІМК':'ВИМК';e.className='pbtn'+(pen?' on':'');
+    document.querySelectorAll('#pcoins button').forEach(b=>{b.className=pcoins[b.dataset.c]?'on':''});
+  }
+  function fillCfg(c){
+    pen=c.enabled;pcoins=Object.assign({},c.coins);
+    document.getElementById('pmode').value=c.stake_mode;
+    document.getElementById('pval').value=c.stake_value;
+    document.getElementById('pdep').value=c.deposit;
+    drawCfg();
+  }
+  function drawAcc(d){
+    const a=d.account,c=a.pnl>=0?'var(--up)':'var(--down)';
+    document.getElementById('pacc').innerHTML="<div class='pgrid'><div><small>Баланс (вільний)</small><b>"+money(a.balance)+"</b></div><div><small>Разом з відкритими</small><b>"+money(a.equity)+"</b></div><div><small>Прибуток</small><b style='color:"+c+"'>"+(a.pnl>=0?'+':'')+money(a.pnl)+" ("+a.pnl_pct.toFixed(1)+"%)</b></div><div><small>Win rate</small><b>"+a.winrate.toFixed(0)+"% ("+a.wins+"/"+(a.wins+a.losses)+")</b></div></div>";
+    const cv=d.curve;
+    if(cv.length>1){
+      const lo=Math.min(...cv),hi=Math.max(...cv),W=320,H=64,sp=(hi-lo)||1;
+      const pts=cv.map((v,i)=>(i/(cv.length-1)*W).toFixed(1)+','+(H-4-(v-lo)/sp*(H-8)).toFixed(1)).join(' ');
+      const col=cv[cv.length-1]>=cv[0]?'#22c55e':'#ef4444';
+      document.getElementById('pspark').innerHTML="<svg viewBox='0 0 "+W+" "+H+"' width='100%' style='display:block'><polyline points='"+pts+"' fill='none' stroke='"+col+"' stroke-width='2'/></svg>";
+    }else document.getElementById('pspark').innerHTML="<div style='font-size:.78rem;color:var(--muted)'>Графік з'явиться після перших закритих угод</div>";
+    let x='';
+    for(const t of d.trades){
+      const sc=t.side==='UP'?'var(--up)':'var(--down)';
+      let st;
+      if(t.status==='open')st="<span style='color:var(--muted)'>очікує…</span>";
+      else if(t.status==='void')st="<span style='color:var(--muted)'>скасовано</span>";
+      else st="<b style='color:"+(t.pnl>=0?'var(--up)':'var(--down)')+"'>"+(t.status==='win'?'✓ ':'✕ ')+(t.pnl>=0?'+':'')+money(t.pnl)+"</b>";
+      const tmm=new Date(t.ts*1000).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
+      x+="<div class='wrow'><div style='display:flex;justify-content:space-between'><span>"+t.symbol+" <span style='color:"+sc+"'>"+t.side+"</span></span>"+st+"</div><div class='sub'>"+tmm+" · вхід "+Math.round(t.entry*100)+"¢ · ставка "+money(t.cost)+" · комісія "+money(t.fee)+"</div></div>";
+    }
+    document.getElementById('plist').innerHTML=x||"<div style='color:var(--muted);font-size:.85rem'>Ще немає угод. Бот відкриє віртуальну угоду на наступному сигналі.</div>";
+  }
+  async function loadP(){
+    try{
+      const d=await (await fetch('/api/paper')).json();
+      if(!pinit){fillCfg(d.config);pinit=true}
+      drawAcc(d);
+    }catch(e){}
+  }
+  async function postP(url,body){
+    const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    return r.json();
+  }
+  async function saveCfg(){
+    const d=await postP('/api/paper/config',{enabled:pen,coins:pcoins,stake_mode:document.getElementById('pmode').value,stake_value:parseFloat(document.getElementById('pval').value)});
+    fillCfg(d.config);drawAcc(d);
+    const m=document.getElementById('pmsg');m.textContent='Збережено ✓';setTimeout(()=>{m.textContent=''},1800);
+  }
+  document.getElementById('pen').onclick=()=>{pen=!pen;drawCfg();saveCfg()};
+  document.getElementById('pcoins').onclick=e=>{const c=e.target.dataset&&e.target.dataset.c;if(c){pcoins[c]=!pcoins[c];drawCfg();saveCfg()}};
+  document.getElementById('psave').onclick=saveCfg;
+  document.getElementById('preset').onclick=async()=>{
+    if(!confirm('Скинути віртуальний рахунок і стерти історію угод?'))return;
+    const d=await postP('/api/paper/reset',{deposit:parseFloat(document.getElementById('pdep').value)});
+    fillCfg(d.config);drawAcc(d);
+  };
   function show(v){
     document.getElementById('sheet').classList.toggle('open',v==='wal');
     document.getElementById('vtop').classList.toggle('open',v==='top');
+    document.getElementById('vpap').classList.toggle('open',v==='pap');
     document.getElementById('nv1').className=v==='main'?'on':'';
     document.getElementById('nv2').className=v==='wal'?'on':'';
     document.getElementById('nv3').className=v==='top'?'on':'';
+    document.getElementById('nv4').className=v==='pap'?'on':'';
     clearInterval(timer);
     if(v==='wal'){data=null;draw();load();timer=setInterval(load,5000)}
     else if(v==='top'){loadT();timer=setInterval(loadT,60000)}
+    else if(v==='pap'){loadP();timer=setInterval(loadP,4000)}
     else window.scrollTo(0,0);
   }
   document.getElementById('nv1').onclick=()=>show('main');
   document.getElementById('nv2').onclick=()=>show('wal');
   document.getElementById('nv3').onclick=()=>show('top');
+  document.getElementById('nv4').onclick=()=>show('pap');
   document.getElementById('wtabs').onclick=e=>{const s=e.target.dataset&&e.target.dataset.s;if(s){sym=s;data=null;draw();load()}};
   document.getElementById('wsub').onclick=e=>{const t=e.target.dataset&&e.target.dataset.t;if(t){sub=t;draw()}};
   document.getElementById('ttabs').onclick=e=>{const p=e.target.dataset&&e.target.dataset.p;if(p){tper=p;loadT()}};
@@ -1017,6 +1319,89 @@ async def api_top(request):
     return JSONResponse(payload)
 
 
+async def _paper_payload():
+    trades = paper["trades"]
+    closed = [t for t in trades if t["status"] in ("win", "loss")]
+    wins = sum(1 for t in closed if t["status"] == "win")
+    losses = len(closed) - wins
+    open_trades = [t for t in trades if t["status"] == "open"]
+    open_cost = sum(t["cost"] + t["fee"] for t in open_trades)
+    pnl = sum(t["pnl"] for t in closed)
+    curve = [round(paper["deposit"], 2)]
+    run = paper["deposit"]
+    for t in sorted([t for t in trades if t["status"] in ("win", "loss", "void") and t["settled_at"]],
+                    key=lambda t: (t["settled_at"], t["id"])):
+        run += t["pnl"]
+        curve.append(round(run, 2))
+    return {
+        "config": {
+            "enabled": paper["enabled"],
+            "coins": paper["coins"],
+            "stake_mode": paper["stake_mode"],
+            "stake_value": paper["stake_value"],
+            "deposit": paper["deposit"],
+        },
+        "account": {
+            "balance": round(paper["balance"], 2),
+            "equity": round(paper["balance"] + open_cost, 2),
+            "pnl": round(pnl, 2),
+            "pnl_pct": round(pnl / paper["deposit"] * 100, 2) if paper["deposit"] else 0.0,
+            "wins": wins,
+            "losses": losses,
+            "open": len(open_trades),
+            "winrate": round(wins / len(closed) * 100, 1) if closed else 0.0,
+        },
+        "curve": curve[-200:],
+        "trades": trades[:100],
+    }
+
+
+async def api_paper(request):
+    return JSONResponse(await _paper_payload())
+
+
+async def api_paper_config(request):
+    try:
+        b = await request.json()
+    except Exception:
+        b = {}
+    if "enabled" in b:
+        paper["enabled"] = bool(b["enabled"])
+    coins = b.get("coins")
+    if isinstance(coins, dict):
+        for c in PAPER_COINS:
+            if c in coins:
+                paper["coins"][c] = bool(coins[c])
+    mode = b.get("stake_mode")
+    if mode in ("pct", "usd"):
+        paper["stake_mode"] = mode
+    try:
+        v = float(b.get("stake_value"))
+        if paper["stake_mode"] == "pct":
+            v = max(0.1, min(100.0, v))
+        else:
+            v = max(1.0, min(1e7, v))
+        paper["stake_value"] = round(v, 2)
+    except (TypeError, ValueError):
+        pass
+    paper_save()
+    return JSONResponse(await _paper_payload())
+
+
+async def api_paper_reset(request):
+    try:
+        b = await request.json()
+        dep = float(b.get("deposit"))
+    except Exception:
+        return JSONResponse(await _paper_payload())
+    dep = max(1.0, min(1e9, dep))
+    paper["deposit"] = round(dep, 2)
+    paper["balance"] = round(dep, 2)
+    paper["trades"] = []
+    paper_save()
+    return JSONResponse(await _paper_payload())
+
+
 class PasswordMiddleware(BaseHTTPMiddleware):
     """Password for the dashboard (browser login window). Off if DASHBOARD_PASSWORD is not set."""
     async def dispatch(self, request, call_next):
@@ -1041,6 +1426,9 @@ app = Starlette(
         Route("/api/status", api_status),
         Route("/api/trades", api_trades),
         Route("/api/top", api_top),
+        Route("/api/paper", api_paper),
+        Route("/api/paper/config", api_paper_config, methods=["POST"]),
+        Route("/api/paper/reset", api_paper_reset, methods=["POST"]),
         Route("/health", health),
     ],
     on_startup=[on_startup],
