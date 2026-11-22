@@ -187,6 +187,21 @@ async def fetch_binance(client: httpx.AsyncClient, symbol: str) -> Optional[floa
     return None
 
 
+def twap_last_seconds(series, seconds: float = 60.0) -> Optional[float]:
+    """Average of the ticks in the last `seconds` of the series (Polymarket settles on a 60s Chainlink TWAP)."""
+    if not series:
+        return None
+    t_end = series[-1][0]
+    pts = [p for t, p in series if t >= t_end - seconds]
+    return sum(pts) / len(pts) if pts else None
+
+
+def twap_final_minute(series) -> Optional[float]:
+    """Average of the ticks in the final minute of the window (t in [240, 300])."""
+    pts = [p for t, p in series if t >= WINDOW_SECONDS - 60]
+    return sum(pts) / len(pts) if len(pts) >= 5 else None
+
+
 async def fetch_polymarket_open(client: httpx.AsyncClient, symbol: str, start_unix: int) -> Optional[float]:
     """Price to Beat straight from Polymarket (same endpoint the website uses)."""
     base = symbol.replace("USDT", "")
@@ -324,7 +339,7 @@ async def price_loop():
                         prev_start_unix = int(ws.window_start.timestamp())
                         final = await fetch_polymarket_close(client, symbol, prev_start_unix)
                         if final is None:
-                            final = ws.last_price
+                            final = twap_final_minute(ws.series) or ws.last_price
                         open_p = ws.price_to_beat
                         actual = "UP" if final >= open_p else "DOWN"
                         predicted = ws.last_signal.get("side")
@@ -427,6 +442,7 @@ async def api_status(request):
             "live_score": live.get("score", 0),
             "source": ws.source,
             "series": [[t, round(p, 4)] for t, p in ws.series],
+            "twap60": (round(twap_last_seconds(ws.series), 4) if ws.series else None),
             "updated": ws.last_update.isoformat() if ws.last_update else None,
         }
 
@@ -538,7 +554,7 @@ h1{font-size:1.15rem;font-weight:700}
   <div class="pt"><span>Графік 5m (Chainlink / Polymarket)</span><span id="cwin"></span></div>
   <div class="ctabs" id="ctabs"><button data-s="BTC">BTC</button><button data-s="ETH">ETH</button><button data-s="SOL">SOL</button><button data-s="XRP">XRP</button></div>
   <div class="ctabs" id="cmode"><button data-m="c">Свічки 1хв</button><button data-m="l">Лінія</button></div>
-  <div class="cnums"><div><small>Price to beat</small><b id="cpb">—</b></div><div><small>Поточна ціна</small><b id="cpn">—</b></div></div>
+  <div class="cnums"><div><small>Price to beat</small><b id="cpb">—</b></div><div><small>Поточна ціна</small><b id="cpn">—</b></div><div><small>TWAP 60с</small><b id="ctw">—</b></div></div>
   <div id="chart"></div>
 </div>
 <div class="panel">
@@ -575,6 +591,7 @@ function drawChart(d){
   const dec=n==="XRP"?4:2,ser=m.series,open=m.open,last=ser[ser.length-1][1];
   document.getElementById("cpb").textContent="$"+f(open,dec);
   const pn=document.getElementById("cpn");pn.textContent="$"+f(last,dec);pn.style.color=last>=open?"var(--up)":"var(--down)";
+  const tw=document.getElementById("ctw");if(m.twap60!=null){tw.textContent="$"+f(m.twap60,dec);tw.style.color=m.twap60>=open?"var(--up)":"var(--down)"}else{tw.textContent="—"}
   document.getElementById("cwin").textContent=(d.time_left||0)+"s left";
   // 1-minute candles
   const cd=[];
