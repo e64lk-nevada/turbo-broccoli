@@ -324,6 +324,66 @@ async def paper_market_meta(client: httpx.AsyncClient, slug: str):
     return meta
 
 
+_bg_tasks: set = set()
+
+
+def spawn(coro):
+    """create_task that keeps a reference (otherwise the task can be garbage-collected mid-flight)."""
+    t = asyncio.create_task(coro)
+    _bg_tasks.add(t)
+    t.add_done_callback(_bg_tasks.discard)
+    return t
+
+
+def paper_skip(coin: str, side: str, start_unix: int, reason: str):
+    """Record why a signal was not traded (shown in the UI, not counted in stats)."""
+    logger.info(f"paper: skipped {coin} {side}: {reason}")
+    paper["trades"].insert(0, {
+        "id": paper["next_id"], "ts": int(datetime.now(timezone.utc).timestamp()),
+        "symbol": coin, "side": side, "window_start": start_unix,
+        "entry": 0.0, "shares": 0.0, "cost": 0.0, "fee": 0.0,
+        "status": "skip", "reason": reason, "pnl": 0.0, "settled_at": None, "balance_after": None,
+    })
+    paper["next_id"] += 1
+    paper_save()
+
+
+async def _paper_get_asks(client: httpx.AsyncClient, coin: str, side: str, start_unix: int):
+    """Order-book asks for the side we want. Retries a few times. Returns (asks, reason)."""
+    slug = f"{coin.lower()}-updown-5m-{start_unix}"
+    reason = "невідома помилка"
+    for attempt in range(3):
+        try:
+            meta = await paper_market_meta(client, slug)
+            if not meta or not meta[0]:
+                reason = "ринок не знайдено на Polymarket"
+            else:
+                want = "up" if side == "UP" else "down"
+                token = next((tok for tok, o in meta[1].items() if o.lower() == want), None)
+                if not token:
+                    reason = "не знайдено токен ринку"
+                else:
+                    r = await client.get("https://clob.polymarket.com/book", params={"token_id": token}, timeout=5.0)
+                    book = r.json()
+                    asks = []
+                    for x in (book.get("asks") or []):
+                        try:
+                            p, sz = float(x["price"]), float(x["size"])
+                        except Exception:
+                            continue
+                        if 0 < p <= 0.99 and sz > 0:
+                            asks.append((p, sz))
+                    asks.sort()
+                    if asks:
+                        return asks, None
+                    reason = "немає пропозицій дешевше 99¢"
+        except Exception as e:
+            reason = "помилка мережі Polymarket"
+            logger.warning(f"paper book attempt {attempt + 1} for {coin}: {e}")
+        await asyncio.sleep(0.7)
+    return None, reason
+
+
 async def paper_open(client: httpx.AsyncClient, symbol: str, side: str, start_unix: int):
     """Open a virtual position at the real Polymarket order book (walks the asks)."""
     coin = symbol.replace("USDT", "")
@@ -333,39 +393,19 @@ async def paper_open(client: httpx.AsyncClient, symbol: str, side: str, start_un
         if any(t["status"] == "open" and t["symbol"] == coin and t["window_start"] == start_unix
                for t in paper["trades"]):
             return
-        slug = f"{coin.lower()}-updown-5m-{start_unix}"
-        meta = await paper_market_meta(client, slug)
-        if not meta or not meta[0]:
-            logger.warning(f"paper: market not found {slug}")
-            return
-        want = "up" if side == "UP" else "down"
-        token = next((tok for tok, o in meta[1].items() if o.lower() == want), None)
-        if not token:
-            logger.warning(f"paper: token not found {slug}")
-            return
-        r = await client.get("https://clob.polymarket.com/book", params={"token_id": token}, timeout=5.0)
-        book = r.json()
-        asks = []
-        for a in book.get("asks") or []:
-            try:
-                p, sz = float(a["price"]), float(a["size"])
-            except Exception:
-                continue
-            if 0 < p <= 0.99 and sz > 0:
-                asks.append((p, sz))
-        asks.sort()
-        if not asks:
-            logger.info(f"paper: no asks for {coin} {side}, skipped")
-            return
+        asks, reason = await _paper_get_asks(client, coin, side, start_unix)
 
         # state may have changed while we were waiting for the network
         if not paper["enabled"] or not paper["coins"].get(coin):
+            return
+        if not asks:
+            paper_skip(coin, side, start_unix, reason or "немає даних")
             return
         bal = paper["balance"]
         stake = bal * paper["stake_value"] / 100.0 if paper["stake_mode"] == "pct" else paper["stake_value"]
         stake = min(stake, bal)
         if stake < 1:
-            logger.info("paper: stake < $1 (balance too low), skipped")
+            paper_skip(coin, side, start_unix, "баланс замалий для ставки")
             return
 
         remaining, shares, cost = stake, 0.0, 0.0
@@ -377,6 +417,7 @@ async def paper_open(client: httpx.AsyncClient, symbol: str, side: str, start_un
             if remaining < 0.01:
                 break
         if shares <= 0 or cost < 1:
+            paper_skip(coin, side, start_unix, "замало ліквідності")
             return
         avg = cost / shares
         fee = shares * PAPER_FEE_RATE * (avg * (1 - avg)) ** 2
@@ -410,6 +451,10 @@ async def paper_open(client: httpx.AsyncClient, symbol: str, side: str, start_un
         logger.info(f"PAPER BUY {coin} {side} {shares:.2f} sh @ {avg:.3f} cost ${cost:.2f} fee ${fee:.3f}")
     except Exception as e:
         logger.warning(f"paper_open error: {e}")
+        try:
+            paper_skip(coin, side, start_unix, "внутрішня помилка")
+        except Exception:
+            pass
 
 
 def paper_settle(coin: str, start_unix: int, actual: str) -> bool:
@@ -613,7 +658,7 @@ async def price_loop():
                         }
                         ws.last_signal = entry
                         signal_history.insert(0, entry)
-                        asyncio.create_task(paper_open(client, symbol, signal["side"], start_unix))
+                        spawn(paper_open(client, symbol, signal["side"], start_unix))
                         if len(signal_history) > 50:
                             signal_history.pop()
                         logger.info(
@@ -808,8 +853,8 @@ h1{font-size:1.15rem;font-weight:700}
       <div class="ctabs" id="pcoins"><button data-c="BTC">BTC</button><button data-c="ETH">ETH</button><button data-c="SOL">SOL</button><button data-c="XRP">XRP</button></div>
       <div class="prow"><label>Ставка</label><select class="inp" id="pmode" style="flex:1.2"><option value="pct">% від балансу</option><option value="usd">$ фіксована</option></select><input class="inp" id="pval" type="number" inputmode="decimal" style="flex:1"></div>
       <div class="prow"><button class="pgo" id="psave">Зберегти</button><span id="pmsg" style="font-size:.78rem;color:var(--up)"></span></div>
-      <div class="prow" style="margin-top:14px"><label>Депозит $</label><input class="inp" id="pdep" type="number" inputmode="decimal" style="flex:1"><button class="pgh" id="preset">Скинути</button></div>
-      <div style="font-size:.7rem;color:var(--muted)">«Скинути» ставить баланс = депозит і стирає історію віртуальних угод.</div>
+      <div class="prow" style="margin-top:14px"><label>Депозит $</label><input class="inp" id="pdep" type="number" inputmode="decimal" style="flex:1"><button class="pgh" id="preset">Скинути рахунок</button></div>
+      <div style="font-size:.7rem;color:var(--muted)">Зміни депозит і натисни «Зберегти» (або «Скинути рахунок»): баланс стане рівним депозиту, історія віртуальних угод буде стерта.</div>
     </div>
     <div class="panel"><div id="pacc"></div><div id="pspark" style="margin-top:10px"></div></div>
     <div class="panel"><div class="pt"><span>Віртуальні угоди</span></div><div id="plist"></div></div>
@@ -979,14 +1024,14 @@ async function refresh(){try{render(await(await fetch("/api/status")).json())}ca
       b.innerHTML=x||'Поки порожньо';
     }catch(e){b.innerHTML='Не вдалося завантажити'}
   }
-  let pinit=false,pen=false,pcoins={};
+  let pinit=false,pen=false,pcoins={},pdepSrv=0;
   const money=x=>(x<0?'-':'')+'$'+Math.abs(x).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
   function drawCfg(){
     const e=document.getElementById('pen');e.textContent=pen?'УВІМК':'ВИМК';e.className='pbtn'+(pen?' on':'');
     document.querySelectorAll('#pcoins button').forEach(b=>{b.className=pcoins[b.dataset.c]?'on':''});
   }
   function fillCfg(c){
-    pen=c.enabled;pcoins=Object.assign({},c.coins);
+    pen=c.enabled;pcoins=Object.assign({},c.coins);pdepSrv=c.deposit;
     document.getElementById('pmode').value=c.stake_mode;
     document.getElementById('pval').value=c.stake_value;
     document.getElementById('pdep').value=c.deposit;
@@ -1008,8 +1053,13 @@ async function refresh(){try{render(await(await fetch("/api/status")).json())}ca
       let st;
       if(t.status==='open')st="<span style='color:var(--muted)'>очікує…</span>";
       else if(t.status==='void')st="<span style='color:var(--muted)'>скасовано</span>";
+      else if(t.status==='skip')st="<span style='color:var(--muted)'>пропущено</span>";
       else st="<b style='color:"+(t.pnl>=0?'var(--up)':'var(--down)')+"'>"+(t.status==='win'?'✓ ':'✕ ')+(t.pnl>=0?'+':'')+money(t.pnl)+"</b>";
       const tmm=new Date(t.ts*1000).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
+      if(t.status==='skip'){
+        x+="<div class='wrow'><div style='display:flex;justify-content:space-between'><span>"+t.symbol+" <span style='color:"+sc+"'>"+t.side+"</span></span>"+st+"</div><div class='sub'>"+new Date(t.ts*1000).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})+" · "+(t.reason||'')+"</div></div>";
+        continue;
+      }
       x+="<div class='wrow'><div style='display:flex;justify-content:space-between'><span>"+t.symbol+" <span style='color:"+sc+"'>"+t.side+"</span></span>"+st+"</div><div class='sub'>"+tmm+" · вхід "+Math.round(t.entry*100)+"¢ · ставка "+money(t.cost)+" · комісія "+money(t.fee)+"</div></div>";
     }
     document.getElementById('plist').innerHTML=x||"<div style='color:var(--muted);font-size:.85rem'>Ще немає угод. Бот відкриє віртуальну угоду на наступному сигналі.</div>";
@@ -1025,14 +1075,25 @@ async function refresh(){try{render(await(await fetch("/api/status")).json())}ca
     const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     return r.json();
   }
-  async function saveCfg(){
-    const d=await postP('/api/paper/config',{enabled:pen,coins:pcoins,stake_mode:document.getElementById('pmode').value,stake_value:parseFloat(document.getElementById('pval').value)});
-    fillCfg(d.config);drawAcc(d);
-    const m=document.getElementById('pmsg');m.textContent='Збережено ✓';setTimeout(()=>{m.textContent=''},1800);
+  async function saveCfg(explicit){
+    const body={enabled:pen,coins:pcoins};
+    if(explicit){
+      body.stake_mode=document.getElementById('pmode').value;
+      body.stake_value=parseFloat(document.getElementById('pval').value);
+      const dep=parseFloat(document.getElementById('pdep').value);
+      if(dep>0&&Math.abs(dep-pdepSrv)>1e-9){
+        if(!confirm('Депозит змінено на '+money(dep)+'. Скинути рахунок і стерти історію віртуальних угод?')){document.getElementById('pdep').value=pdepSrv;return}
+        body.deposit=dep;
+      }
+    }
+    const d=await postP('/api/paper/config',body);
+    if(explicit)fillCfg(d.config);else{pdepSrv=d.config.deposit;drawCfg()}
+    drawAcc(d);
+    if(explicit){const m=document.getElementById('pmsg');m.textContent='Збережено ✓';setTimeout(()=>{m.textContent=''},1800)}
   }
-  document.getElementById('pen').onclick=()=>{pen=!pen;drawCfg();saveCfg()};
-  document.getElementById('pcoins').onclick=e=>{const c=e.target.dataset&&e.target.dataset.c;if(c){pcoins[c]=!pcoins[c];drawCfg();saveCfg()}};
-  document.getElementById('psave').onclick=saveCfg;
+  document.getElementById('pen').onclick=()=>{pen=!pen;drawCfg();saveCfg(false)};
+  document.getElementById('pcoins').onclick=e=>{const c=e.target.dataset&&e.target.dataset.c;if(c){pcoins[c]=!pcoins[c];drawCfg();saveCfg(false)}};
+  document.getElementById('psave').onclick=()=>saveCfg(true);
   document.getElementById('preset').onclick=async()=>{
     if(!confirm('Скинути віртуальний рахунок і стерти історію угод?'))return;
     const d=await postP('/api/paper/reset',{deposit:parseFloat(document.getElementById('pdep').value)});
@@ -1384,8 +1445,23 @@ async def api_paper_config(request):
         paper["stake_value"] = round(v, 2)
     except (TypeError, ValueError):
         pass
+    if "deposit" in b:
+        try:
+            dep = float(b["deposit"])
+            if abs(dep - paper["deposit"]) > 1e-9:
+                _paper_reset(dep)
+        except (TypeError, ValueError):
+            pass
     paper_save()
     return JSONResponse(await _paper_payload())
+
+
+def _paper_reset(dep: float):
+    dep = max(1.0, min(1e9, dep))
+    paper["deposit"] = round(dep, 2)
+    paper["balance"] = round(dep, 2)
+    paper["trades"] = []
+    paper_save()
 
 
 async def api_paper_reset(request):
@@ -1394,11 +1470,7 @@ async def api_paper_reset(request):
         dep = float(b.get("deposit"))
     except Exception:
         return JSONResponse(await _paper_payload())
-    dep = max(1.0, min(1e9, dep))
-    paper["deposit"] = round(dep, 2)
-    paper["balance"] = round(dep, 2)
-    paper["trades"] = []
-    paper_save()
+    _paper_reset(dep)
     return JSONResponse(await _paper_payload())
 
 
