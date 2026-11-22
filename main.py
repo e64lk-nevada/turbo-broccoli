@@ -465,7 +465,7 @@ HTML_PAGE = """<!DOCTYPE html>
 <html lang="uk">
 <head>
 <meta charset="UTF-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1"/>
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover"/>
 <meta name="apple-mobile-web-app-capable" content="yes"/>
 <title>5m Signals</title>
 <style>
@@ -504,12 +504,17 @@ h1{font-size:1.15rem;font-weight:700}
 .cnums{display:flex;gap:18px;margin-bottom:8px}
 .cnums small{display:block;font-size:.68rem;color:var(--muted)}
 .cnums b{font-size:1.05rem;font-variant-numeric:tabular-nums}
-.fab{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);background:var(--accent);color:#0b0b0c;border:0;border-radius:999px;padding:12px 22px;font-size:.9rem;font-weight:700;box-shadow:0 6px 24px rgba(0,0,0,.6);z-index:20}
-.sheet{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;z-index:30}
-.sheet.open{display:block}
-.sheet .in{position:absolute;left:0;right:0;bottom:0;max-height:88%;background:var(--card);border-top:1px solid var(--border);border-radius:18px 18px 0 0;padding:16px;overflow-y:auto}
-.sheet h3{margin:0 0 10px;font-size:1rem;display:flex;justify-content:space-between;align-items:center}
-.sheet .x{background:none;border:0;color:var(--muted);font-size:1.4rem}
+.bnav{position:fixed;left:0;right:0;bottom:0;display:flex;background:#101012;border-top:1px solid var(--border);padding-bottom:env(safe-area-inset-bottom);z-index:40}
+.bnav button{flex:1;background:none;border:0;color:var(--muted);padding:9px 0 8px;font-size:1.25rem;display:flex;flex-direction:column;align-items:center;gap:2px}
+.bnav button span{font-size:.68rem;font-weight:600;letter-spacing:.04em}
+.bnav button.on{color:var(--text)}
+.sheet{position:fixed;left:0;right:0;top:0;bottom:calc(58px + env(safe-area-inset-bottom));background:var(--bg);display:none;z-index:30;flex-direction:column;padding:14px 16px 0}
+.sheet.open{display:flex}
+.sheet h3{margin:0 0 10px;font-size:1rem}
+.sheet .scroll{flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch;padding-bottom:12px}
+.subtabs{display:flex;gap:6px;margin:10px 0 4px;overflow-x:auto}
+.subtabs button{flex:none;padding-left:14px!important;padding-right:14px!important;white-space:nowrap;background:#1c1c1f;color:var(--muted);border:1px solid var(--border);border-radius:8px;padding:8px 0;font-size:.74rem;font-weight:600}
+.subtabs button.on{color:var(--text);border-color:var(--accent)}
 .vbar{display:flex;height:10px;border-radius:6px;overflow:hidden;margin:8px 0 4px;background:#232326}
 .wrow{padding:9px 0;border-bottom:1px solid var(--border);font-size:.82rem}
 .wrow a{color:var(--text);text-decoration:none;font-family:ui-monospace,Menlo,monospace}
@@ -542,12 +547,19 @@ h1{font-size:1.15rem;font-weight:700}
   <div id="hist"></div>
 </div>
 <div style="height:90px"></div>
-<button class="fab" id="fab">🐋 Гаманці</button>
-<div class="sheet" id="sheet"><div class="in">
-  <h3><span>Угоди на Polymarket (поточне вікно)</span><button class="x" id="sx">×</button></h3>
+<div class="sheet" id="sheet">
+  <h3>Угоди на Polymarket (поточне вікно)</h3>
   <div class="ctabs" id="wtabs"><button data-s="BTC">BTC</button><button data-s="ETH">ETH</button><button data-s="SOL">SOL</button><button data-s="XRP">XRP</button></div>
-  <div id="wbody" style="color:var(--muted);font-size:.85rem">Завантаження…</div>
-</div></div>
+  <div id="wsum"></div>
+  <div class="subtabs" id="wsub"><button data-t="feed">Стрічка</button><button data-t="buy">Купівлі</button><button data-t="sell">Продажі</button><button data-t="up">Up</button><button data-t="down">Down</button><button data-t="top">Гаманці</button></div>
+  <div class="scroll" id="wbody" style="color:var(--muted);font-size:.85rem">Завантаження…</div>
+</div>
+<div class="sheet" id="vtop">
+  <h3>Найуспішніші трейдери · крипто</h3>
+  <div class="ctabs" id="ttabs"><button data-p="day">Сьогодні</button><button data-p="week">Тиждень</button><button data-p="month">Місяць</button></div>
+  <div class="scroll" id="tbody" style="color:var(--muted);font-size:.85rem;margin-top:10px">Завантаження…</div>
+</div>
+<nav class="bnav"><button id="nv1" class="on">📈<span>Сигнали</span></button><button id="nv2">🐋<span>Гаманці</span></button><button id="nv3">🏆<span>Трейдери</span></button></nav>
 <script>
 const S=["BTC","ETH","SOL","XRP"];
 function f(n,d=2){return n==null?"—":Number(n).toFixed(d)}
@@ -655,7 +667,7 @@ function render(d){
 }
 async function refresh(){try{render(await(await fetch("/api/status")).json())}catch(e){document.getElementById("badge").textContent="offline"}}
 (function(){
-  let ws_sym='BTC',timer=null;
+  let sym='BTC',sub='feed',tper='day',timer=null,data=null;
   const esc=x=>String(x).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
   const short=a=>a?a.slice(0,6)+'…'+a.slice(-4):'—';
   const usd=x=>'$'+Math.abs(x).toLocaleString('en-US',{maximumFractionDigits:0});
@@ -664,34 +676,68 @@ async function refresh(){try{render(await(await fetch("/api/status")).json())}ca
     const link='https://polymarket.com/profile/'+esc(w.wallet);
     return "<a href='"+link+"' target='_blank' rel='noopener'>"+(w.name?esc(w.name)+' · ':'')+short(w.wallet)+"</a>";
   }
-  async function load(){
-    const b=document.getElementById('wbody');
-    document.querySelectorAll('#wtabs button').forEach(x=>{x.className=x.dataset.s===ws_sym?'on':''});
-    try{
-      const r=await fetch('/api/trades?symbol='+ws_sym);
-      const d=await r.json();
-      if(!d.ok){b.innerHTML=esc(d.error||'Помилка');return}
-      const up=d.totals.Up,dn=d.totals.Down,tot=up+dn||1;
-      let x="<div style='display:flex;justify-content:space-between;font-size:.85rem'><span style='color:var(--up)'>Up "+usd(up)+"</span><span style='color:var(--down)'>Down "+usd(dn)+"</span></div>";
-      x+="<div class='vbar'><div style='width:"+(up/tot*100)+"%;background:#22c55e'></div><div style='flex:1;background:#ef4444'></div></div>";
-      x+="<div class='sec'>Топ гаманці (нетто, $)</div>";
-      for(const w of d.wallets){
+  function tradeRow(t){
+    const c=t.outcome==='Up'?'var(--up)':'var(--down)';
+    return "<div class='wrow'>"+who(t)+"<div class='sub'>"+(t.side==='BUY'?'купив':'продав')+" <span style='color:"+c+"'>"+esc(t.outcome)+"</span> · "+usd(t.usd)+" @ "+Math.round(t.price*100)+"¢ · "+tm(t.ts)+"</div></div>";
+  }
+  function draw(){
+    document.querySelectorAll('#wtabs button').forEach(x=>{x.className=x.dataset.s===sym?'on':''});
+    document.querySelectorAll('#wsub button').forEach(x=>{x.className=x.dataset.t===sub?'on':''});
+    const b=document.getElementById('wbody'),sm=document.getElementById('wsum');
+    if(!data){b.innerHTML='Завантаження…';return}
+    if(!data.ok){sm.innerHTML='';b.innerHTML=esc(data.error||'Помилка');return}
+    const up=data.totals.Up,dn=data.totals.Down,tot=up+dn||1;
+    sm.innerHTML="<div style='display:flex;justify-content:space-between;font-size:.85rem'><span style='color:var(--up)'>Up "+usd(up)+"</span><span style='color:var(--down)'>Down "+usd(dn)+"</span></div><div class='vbar'><div style='width:"+(up/tot*100)+"%;background:#22c55e'></div><div style='flex:1;background:#ef4444'></div></div>";
+    let x='';
+    if(sub==='top'){
+      for(const w of data.wallets){
         x+="<div class='wrow'>"+who(w)+"<div class='sub'><span style='color:var(--up)'>Up "+(w.Up<0?'-':'')+usd(w.Up)+"</span> · <span style='color:var(--down)'>Down "+(w.Down<0?'-':'')+usd(w.Down)+"</span> · угод: "+w.n+" · "+tm(w.last)+"</div></div>";
       }
-      x+="<div class='sec'>Останні угоди</div>";
-      for(const t of d.trades){
-        const c=t.outcome==='Up'?'var(--up)':'var(--down)';
-        x+="<div class='wrow'>"+who(t)+"<div class='sub'>"+(t.side==='BUY'?'купив':'продав')+" <span style='color:"+c+"'>"+esc(t.outcome)+"</span> · "+usd(t.usd)+" @ "+Math.round(t.price*100)+"¢ · "+tm(t.ts)+"</div></div>";
+    }else{
+      const list=data.trades.filter(t=>sub==='feed'||(sub==='buy'&&t.side==='BUY')||(sub==='sell'&&t.side==='SELL')||(sub==='up'&&t.outcome==='Up')||(sub==='down'&&t.outcome==='Down'));
+      for(const t of list)x+=tradeRow(t);
+    }
+    b.innerHTML=x||"<div style='color:var(--muted)'>Поки порожньо</div>";
+  }
+  async function load(){
+    try{
+      const r=await fetch('/api/trades?symbol='+sym);
+      data=await r.json();
+    }catch(e){data={ok:false,error:'Не вдалося завантажити'}}
+    draw();
+  }
+  async function loadT(){
+    document.querySelectorAll('#ttabs button').forEach(x=>{x.className=x.dataset.p===tper?'on':''});
+    const b=document.getElementById('tbody');
+    try{
+      const r=await fetch('/api/top?period='+tper);
+      const d=await r.json();
+      if(!d.ok){b.innerHTML=esc(d.error||'Помилка');return}
+      let x='';
+      for(const w of d.rows){
+        const c=w.pnl>=0?'var(--up)':'var(--down)';
+        x+="<div class='wrow'><div style='display:flex;justify-content:space-between;align-items:center'><span><span style='color:var(--muted)'>#"+w.rank+"</span> "+who(w)+"</span><b style='color:"+c+"'>"+(w.pnl>=0?'+':'-')+usd(w.pnl)+"</b></div></div>";
       }
-      b.innerHTML=x;
+      b.innerHTML=x||'Поки порожньо';
     }catch(e){b.innerHTML='Не вдалося завантажити'}
   }
-  function open(){document.getElementById('sheet').classList.add('open');load();timer=setInterval(load,5000)}
-  function close(){document.getElementById('sheet').classList.remove('open');clearInterval(timer)}
-  document.getElementById('fab').onclick=open;
-  document.getElementById('sx').onclick=close;
-  document.getElementById('sheet').onclick=e=>{if(e.target.id==='sheet')close()};
-  document.getElementById('wtabs').onclick=e=>{const s=e.target.dataset&&e.target.dataset.s;if(s){ws_sym=s;load()}};
+  function show(v){
+    document.getElementById('sheet').classList.toggle('open',v==='wal');
+    document.getElementById('vtop').classList.toggle('open',v==='top');
+    document.getElementById('nv1').className=v==='main'?'on':'';
+    document.getElementById('nv2').className=v==='wal'?'on':'';
+    document.getElementById('nv3').className=v==='top'?'on':'';
+    clearInterval(timer);
+    if(v==='wal'){data=null;draw();load();timer=setInterval(load,5000)}
+    else if(v==='top'){loadT();timer=setInterval(loadT,60000)}
+    else window.scrollTo(0,0);
+  }
+  document.getElementById('nv1').onclick=()=>show('main');
+  document.getElementById('nv2').onclick=()=>show('wal');
+  document.getElementById('nv3').onclick=()=>show('top');
+  document.getElementById('wtabs').onclick=e=>{const s=e.target.dataset&&e.target.dataset.s;if(s){sym=s;data=null;draw();load()}};
+  document.getElementById('wsub').onclick=e=>{const t=e.target.dataset&&e.target.dataset.t;if(t){sub=t;draw()}};
+  document.getElementById('ttabs').onclick=e=>{const p=e.target.dataset&&e.target.dataset.p;if(p){tper=p;loadT()}};
 })();
 refresh();setInterval(refresh,2000);
 </script>
@@ -825,12 +871,81 @@ async def api_trades(request):
         "window_start": start,
         "totals": {"Up": round(totals["Up"], 2), "Down": round(totals["Down"], 2)},
         "wallets": top,
-        "trades": trades[:40],
+        "trades": trades[:100],
     }
     _trades_cache[slug] = (now, payload)
     if len(_trades_cache) > 40:
         for k in sorted(_trades_cache, key=lambda k: _trades_cache[k][0])[:20]:
             _trades_cache.pop(k, None)
+    return JSONResponse(payload)
+
+
+_top_cache: Dict[str, tuple] = {}
+
+
+async def api_top(request):
+    """Best traders by profit (Polymarket leaderboard, crypto category)."""
+    period = (request.query_params.get("period") or "day").lower()
+    if period not in ("day", "week", "month"):
+        period = "day"
+    now = int(datetime.now(timezone.utc).timestamp())
+    cached = _top_cache.get(period)
+    if cached and now - cached[0] < 60:
+        return JSONResponse(cached[1])
+
+    def g(t, *keys, default=None):
+        for k in keys:
+            if k in t and t[k] is not None:
+                return t[k]
+        return default
+
+    attempts = [
+        ("https://data-api.polymarket.com/v2/leaderboard",
+         {"time_period": period, "category": "crypto", "sort_by": "PNL", "limit": 25}),
+        ("https://data-api.polymarket.com/v1/leaderboard",
+         {"timePeriod": period.upper(), "category": "CRYPTO", "orderBy": "PNL", "limit": 25}),
+    ]
+    rows = None
+    last_err = ""
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as c:
+            for url, params in attempts:
+                r = await c.get(url, params=params)
+                try:
+                    body = r.json()
+                except Exception:
+                    body = None
+                if r.status_code == 200 and body is not None:
+                    data = body.get("data") if isinstance(body, dict) else body
+                    if isinstance(data, dict):
+                        data = next((v for v in data.values() if isinstance(v, list)), [])
+                    if isinstance(data, list):
+                        rows = data
+                        break
+                last_err = f"{r.status_code} {str(body)[:150]}"
+                logger.warning(f"leaderboard {url}: {last_err}")
+    except Exception as e:
+        logger.warning(f"api_top error: {e}")
+        return JSONResponse({"ok": False, "error": "Не вдалося отримати дані з Polymarket"})
+    if rows is None:
+        return JSONResponse({"ok": False, "error": f"Polymarket: {last_err}"})
+
+    out = []
+    for i, t in enumerate(rows):
+        if not isinstance(t, dict):
+            continue
+        try:
+            pnl = float(g(t, "pnl", "profit", default=0))
+        except Exception:
+            pnl = 0.0
+        out.append({
+            "rank": g(t, "rank", default=i + 1),
+            "wallet": g(t, "proxy_wallet", "proxyWallet", "address", "wallet", default=""),
+            "name": g(t, "user_name", "userName", "name", "pseudonym", default=""),
+            "pnl": round(pnl, 2),
+        })
+    payload = {"ok": True, "period": period, "rows": out}
+    _top_cache[period] = (now, payload)
     return JSONResponse(payload)
 
 
@@ -857,6 +972,7 @@ app = Starlette(
         Route("/", dashboard),
         Route("/api/status", api_status),
         Route("/api/trades", api_trades),
+        Route("/api/top", api_top),
         Route("/health", health),
     ],
     on_startup=[on_startup],
