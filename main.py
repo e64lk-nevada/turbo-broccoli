@@ -739,11 +739,28 @@ async def api_trades(request):
                     _cid_cache[slug] = cid
             if not cid:
                 return JSONResponse({"ok": False, "error": "Ринок ще не знайдено, спробуй за кілька секунд", "slug": slug})
-            r = await c.get(
-                "https://data-api.polymarket.com/trades",
-                params={"market": cid, "limit": 300, "takerOnly": "false"},
-            )
-            raw = r.json()
+            raw = None
+            last_err = ""
+            # Data API v1 retired (Nov 2, 2026) -> use v2; try a few param variants
+            for params in (
+                {"condition": cid, "limit": 200, "takerOnly": "false"},
+                {"condition": cid, "limit": 200},
+                {"condition": cid},
+            ):
+                r = await c.get("https://data-api.polymarket.com/v2/trades", params=params)
+                try:
+                    body = r.json()
+                except Exception:
+                    body = None
+                if r.status_code == 200 and body is not None:
+                    raw = body.get("data") if isinstance(body, dict) else body
+                    if raw is None:
+                        raw = []
+                    break
+                last_err = f"{r.status_code} {str(body)[:150]}"
+                logger.warning(f"data-api v2/trades {params}: {last_err}")
+            if raw is None:
+                return JSONResponse({"ok": False, "error": f"Polymarket: {last_err}", "slug": slug})
     except Exception as e:
         logger.warning(f"api_trades error: {e}")
         return JSONResponse({"ok": False, "error": "Не вдалося отримати дані з Polymarket", "slug": slug})
@@ -751,21 +768,40 @@ async def api_trades(request):
     if not isinstance(raw, list):
         return JSONResponse({"ok": False, "error": "Polymarket повернув неочікувану відповідь", "slug": slug})
 
+    def g(t, *keys, default=None):
+        for k in keys:
+            if k in t and t[k] is not None:
+                return t[k]
+        return default
+
+    def to_ts(v):
+        if v is None:
+            return 0
+        try:
+            return int(float(v))
+        except Exception:
+            try:
+                return int(datetime.fromisoformat(str(v).replace("Z", "+00:00")).timestamp())
+            except Exception:
+                return 0
+
     trades = []
     wallets: Dict[str, dict] = {}
     totals = {"Up": 0.0, "Down": 0.0}
     for t in raw:
+        if not isinstance(t, dict):
+            continue
         try:
-            addr = t.get("proxyWallet") or ""
-            outcome = t.get("outcome") or ""
-            side = (t.get("side") or "").upper()
-            size = float(t.get("size") or 0)
-            price = float(t.get("price") or 0)
+            addr = g(t, "proxy_wallet", "proxyWallet", default="")
+            outcome = g(t, "outcome", default="")
+            side = str(g(t, "side", default="")).upper()
+            size = float(g(t, "size", default=0))
+            price = float(g(t, "price", default=0))
             usd = size * price
-            ts = int(t.get("timestamp") or 0)
+            ts = to_ts(g(t, "timestamp", "created_at", "createdAt"))
         except Exception:
             continue
-        name = t.get("name") or t.get("pseudonym") or ""
+        name = g(t, "name", "pseudonym", default="")
         trades.append({"wallet": addr, "name": name, "side": side, "outcome": outcome,
                        "usd": round(usd, 2), "price": round(price, 3), "ts": ts})
         if outcome in totals and side == "BUY":
@@ -776,6 +812,7 @@ async def api_trades(request):
         w["n"] += 1
         w["last"] = max(w["last"], ts)
 
+    trades.sort(key=lambda x: x["ts"], reverse=True)
     top = sorted(wallets.values(), key=lambda w: abs(w["Up"]) + abs(w["Down"]), reverse=True)[:25]
     for w in top:
         w["Up"] = round(w["Up"], 2)
