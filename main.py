@@ -1403,7 +1403,7 @@ async def api_top(request):
             pnl = 0.0
         out.append({
             "rank": g(t, "rank", default=i + 1),
-            "wallet": g(t, "proxy_wallet", "proxyWallet", "address", "wallet", default=""),
+            "wallet": g(t, "user_id", "proxy_wallet", "proxyWallet", "address", "wallet", default=""),
             "name": g(t, "user_name", "userName", "name", "pseudonym", default=""),
             "pnl": round(pnl, 2),
         })
@@ -1560,7 +1560,7 @@ async def _fetch_leaderboard(c: httpx.AsyncClient, period: str, limit: int):
                 for t in data:
                     if not isinstance(t, dict):
                         continue
-                    w = _g(t, "proxy_wallet", "proxyWallet", "address", "wallet", default="")
+                    w = _g(t, "user_id", "proxy_wallet", "proxyWallet", "address", "wallet", default="")
                     if w:
                         out.append({"wallet": w, "name": _g(t, "user_name", "userName", "name", "pseudonym", default="")})
                 return out, ""
@@ -1639,7 +1639,8 @@ async def _clean_compute(period: str):
             cands, err = await _fetch_leaderboard(c, period, CLEAN_CANDIDATES)
             if not cands:
                 st["status"] = "error"
-                st["error"] = f"Не вдалося отримати кандидатів: {err}"
+                st["error"] = f"Не вдалося отримати кандидатів: {err or 'порожній список'}"
+                st["ts"] = int(datetime.now(timezone.utc).timestamp())
                 return
             st["total"] = len(cands)
             sem = asyncio.Semaphore(10)
@@ -1687,6 +1688,7 @@ async def _clean_compute(period: str):
         logger.warning(f"_clean_compute error: {e}")
         st["status"] = "error"
         st["error"] = "Помилка під час підрахунку"
+        st["ts"] = int(datetime.now(timezone.utc).timestamp())
 
 
 async def api_clean(request):
@@ -1699,7 +1701,7 @@ async def api_clean(request):
         st = _clean[period] = {"status": "loading", "ts": 0, "rows": [], "progress": 0, "total": CLEAN_CANDIDATES,
                                "incomplete": 0, "failed": 0, "scope_all": False, "error": ""}
         spawn(_clean_compute(period))
-    elif st["status"] != "loading" and now - st["ts"] > CLEAN_TTL:
+    elif st["status"] != "loading" and now - st["ts"] > (60 if st["status"] == "error" else CLEAN_TTL):
         spawn(_clean_compute(period))
         st["status"] = "loading"
     return JSONResponse({"ok": True, "period": period, **{k: st.get(k) for k in
