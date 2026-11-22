@@ -689,11 +689,11 @@ async function refresh(){try{render(await(await fetch("/api/status")).json())}ca
     if(!data){b.innerHTML='Завантаження…';return}
     if(!data.ok){sm.innerHTML='';b.innerHTML=esc(data.error||'Помилка');return}
     const up=data.totals.Up,dn=data.totals.Down,tot=up+dn||1;
-    sm.innerHTML="<div style='display:flex;justify-content:space-between;font-size:.85rem'><span style='color:var(--up)'>Up "+usd(up)+"</span><span style='color:var(--down)'>Down "+usd(dn)+"</span></div><div class='vbar'><div style='width:"+(up/tot*100)+"%;background:#22c55e'></div><div style='flex:1;background:#ef4444'></div></div>";
+    sm.innerHTML="<div style='display:flex;justify-content:space-between;font-size:.85rem'><span style='color:var(--up)'>Up "+usd(up)+"</span><span style='color:var(--down)'>Down "+usd(dn)+"</span></div><div class='vbar'><div style='width:"+(up/tot*100)+"%;background:#22c55e'></div><div style='flex:1;background:#ef4444'></div></div><div style='font-size:.72rem;color:var(--muted)'>Завантажено угод: "+(data.count||0)+" (куплено, у $)</div>";
     let x='';
     if(sub==='top'){
       for(const w of data.wallets){
-        x+="<div class='wrow'>"+who(w)+"<div class='sub'><span style='color:var(--up)'>Up "+(w.Up<0?'-':'')+usd(w.Up)+"</span> · <span style='color:var(--down)'>Down "+(w.Down<0?'-':'')+usd(w.Down)+"</span> · угод: "+w.n+" · "+tm(w.last)+"</div></div>";
+        x+="<div class='wrow'>"+who(w)+"<div class='sub'>Купив: <span style='color:var(--up)'>Up "+usd(w.bUp)+"</span> · <span style='color:var(--down)'>Down "+usd(w.bDown)+"</span></div><div class='sub'>Продав: <span style='color:var(--up)'>Up "+usd(w.sUp)+"</span> · <span style='color:var(--down)'>Down "+usd(w.sDown)+"</span> · угод: "+w.n+" · "+tm(w.last)+"</div></div>";
       }
     }else{
       const list=data.trades.filter(t=>sub==='feed'||(sub==='buy'&&t.side==='BUY')||(sub==='sell'&&t.side==='SELL')||(sub==='up'&&t.outcome==='Up')||(sub==='down'&&t.outcome==='Down'));
@@ -757,8 +757,9 @@ async def on_startup():
     logger.info("RTDS + price loops started")
 
 
-_cid_cache: Dict[str, str] = {}
+_cid_cache: Dict[str, tuple] = {}
 _trades_cache: Dict[str, tuple] = {}
+MAX_TRADE_PAGES = 4
 
 
 async def api_trades(request):
@@ -771,50 +772,8 @@ async def api_trades(request):
     slug = f"{sym.lower()}-updown-5m-{start}"
 
     cached = _trades_cache.get(slug)
-    if cached and now - cached[0] < 3:
+    if cached and now - cached[0] < 4:
         return JSONResponse(cached[1])
-
-    try:
-        async with httpx.AsyncClient(timeout=8.0) as c:
-            cid = _cid_cache.get(slug)
-            if not cid:
-                r = await c.get("https://gamma-api.polymarket.com/events", params={"slug": slug})
-                data = r.json()
-                ev = data[0] if isinstance(data, list) and data else None
-                mk = (ev or {}).get("markets") or []
-                cid = mk[0].get("conditionId") if mk else None
-                if cid:
-                    _cid_cache[slug] = cid
-            if not cid:
-                return JSONResponse({"ok": False, "error": "Ринок ще не знайдено, спробуй за кілька секунд", "slug": slug})
-            raw = None
-            last_err = ""
-            # Data API v1 retired (Nov 2, 2026) -> use v2; try a few param variants
-            for params in (
-                {"condition": cid, "limit": 200, "takerOnly": "false"},
-                {"condition": cid, "limit": 200},
-                {"condition": cid},
-            ):
-                r = await c.get("https://data-api.polymarket.com/v2/trades", params=params)
-                try:
-                    body = r.json()
-                except Exception:
-                    body = None
-                if r.status_code == 200 and body is not None:
-                    raw = body.get("data") if isinstance(body, dict) else body
-                    if raw is None:
-                        raw = []
-                    break
-                last_err = f"{r.status_code} {str(body)[:150]}"
-                logger.warning(f"data-api v2/trades {params}: {last_err}")
-            if raw is None:
-                return JSONResponse({"ok": False, "error": f"Polymarket: {last_err}", "slug": slug})
-    except Exception as e:
-        logger.warning(f"api_trades error: {e}")
-        return JSONResponse({"ok": False, "error": "Не вдалося отримати дані з Polymarket", "slug": slug})
-
-    if not isinstance(raw, list):
-        return JSONResponse({"ok": False, "error": "Polymarket повернув неочікувану відповідь", "slug": slug})
 
     def g(t, *keys, default=None):
         for k in keys:
@@ -826,54 +785,144 @@ async def api_trades(request):
         if v is None:
             return 0
         try:
-            return int(float(v))
+            x = int(float(v))
         except Exception:
             try:
                 return int(datetime.fromisoformat(str(v).replace("Z", "+00:00")).timestamp())
             except Exception:
                 return 0
+        return x // 1000 if x > 10**11 else x
+
+    def as_list(v):
+        if isinstance(v, str):
+            try:
+                v = json.loads(v)
+            except Exception:
+                return []
+        return v if isinstance(v, list) else []
+
+    raw: list = []
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as c:
+            meta = _cid_cache.get(slug)
+            if not meta:
+                r = await c.get("https://gamma-api.polymarket.com/events", params={"slug": slug})
+                data = r.json()
+                ev = data[0] if isinstance(data, list) and data else None
+                mk = (ev or {}).get("markets") or []
+                if mk:
+                    m0 = mk[0]
+                    tokens = as_list(m0.get("clobTokenIds"))
+                    outs = as_list(m0.get("outcomes"))
+                    tmap = {str(t): str(o) for t, o in zip(tokens, outs)}
+                    meta = (m0.get("conditionId"), tmap)
+                    if meta[0]:
+                        _cid_cache[slug] = meta
+            if not meta or not meta[0]:
+                return JSONResponse({"ok": False, "error": "Ринок ще не знайдено, спробуй за кілька секунд", "slug": slug})
+            cid, tmap = meta
+
+            # first page (try a few param variants), then follow the cursor
+            body = None
+            last_err = ""
+            for params in (
+                {"condition": cid, "limit": 500, "taker_only": "false"},
+                {"condition": cid, "limit": 200, "taker_only": "false"},
+                {"condition": cid, "taker_only": "false"},
+                {"condition": cid},
+            ):
+                r = await c.get("https://data-api.polymarket.com/v2/trades", params=params)
+                try:
+                    b = r.json()
+                except Exception:
+                    b = None
+                if r.status_code == 200 and b is not None:
+                    body = b
+                    break
+                last_err = f"{r.status_code} {str(b)[:150]}"
+                logger.warning(f"data-api v2/trades {params}: {last_err}")
+            if body is None:
+                return JSONResponse({"ok": False, "error": f"Polymarket: {last_err}", "slug": slug})
+
+            pages = 0
+            while True:
+                rows = body.get("data") if isinstance(body, dict) else body
+                if isinstance(rows, list):
+                    raw.extend(rows)
+                pages += 1
+                pg = (body.get("pagination") or {}) if isinstance(body, dict) else {}
+                cur = pg.get("next_cursor")
+                if not cur or pages >= MAX_TRADE_PAGES or pg.get("has_more") is False:
+                    break
+                r = await c.get("https://data-api.polymarket.com/v2/trades", params={"condition": cid, "cursor": cur})
+                if r.status_code != 200:
+                    break
+                try:
+                    body = r.json()
+                except Exception:
+                    break
+    except Exception as e:
+        logger.warning(f"api_trades error: {e}")
+        if not raw:
+            return JSONResponse({"ok": False, "error": "Не вдалося отримати дані з Polymarket", "slug": slug})
 
     trades = []
     wallets: Dict[str, dict] = {}
     totals = {"Up": 0.0, "Down": 0.0}
+    seen = set()
     for t in raw:
         if not isinstance(t, dict):
             continue
         try:
-            addr = g(t, "proxy_wallet", "proxyWallet", default="")
-            outcome = g(t, "outcome", default="")
+            addr = g(t, "proxy_wallet", "proxyWallet", "wallet", default="")
             side = str(g(t, "side", default="")).upper()
             size = float(g(t, "size", default=0))
             price = float(g(t, "price", default=0))
-            usd = size * price
             ts = to_ts(g(t, "timestamp", "created_at", "createdAt"))
         except Exception:
             continue
+        outcome = g(t, "outcome", default="")
+        if outcome not in ("Up", "Down"):
+            tok = str(g(t, "token_id", "asset", "assetId", "asset_id", default=""))
+            outcome = tmap.get(tok, outcome)
+        if outcome not in ("Up", "Down"):
+            idx = g(t, "outcome_index", "outcomeIndex")
+            if idx in (0, 1, "0", "1"):
+                outcome = "Up" if int(idx) == 0 else "Down"
+        txh = g(t, "transaction_hash", "transactionHash", default="")
+        key = (txh, addr, side, outcome, size, price, ts) if txh else None
+        if key is not None:
+            if key in seen:
+                continue
+            seen.add(key)
+        usd = size * price
         name = g(t, "name", "pseudonym", default="")
         trades.append({"wallet": addr, "name": name, "side": side, "outcome": outcome,
                        "usd": round(usd, 2), "price": round(price, 3), "ts": ts})
         if outcome in totals and side == "BUY":
             totals[outcome] += usd
-        w = wallets.setdefault(addr, {"wallet": addr, "name": name, "Up": 0.0, "Down": 0.0, "n": 0, "last": 0})
+        w = wallets.setdefault(addr, {"wallet": addr, "name": name, "bUp": 0.0, "bDown": 0.0,
+                                      "sUp": 0.0, "sDown": 0.0, "n": 0, "last": 0})
         if outcome in ("Up", "Down"):
-            w[outcome] += usd if side == "BUY" else -usd
+            w[("b" if side == "BUY" else "s") + outcome] += usd
         w["n"] += 1
         w["last"] = max(w["last"], ts)
 
     trades.sort(key=lambda x: x["ts"], reverse=True)
-    top = sorted(wallets.values(), key=lambda w: abs(w["Up"]) + abs(w["Down"]), reverse=True)[:25]
+    top = sorted(wallets.values(), key=lambda w: w["bUp"] + w["bDown"] + w["sUp"] + w["sDown"], reverse=True)[:40]
     for w in top:
-        w["Up"] = round(w["Up"], 2)
-        w["Down"] = round(w["Down"], 2)
+        for k in ("bUp", "bDown", "sUp", "sDown"):
+            w[k] = round(w[k], 2)
 
     payload = {
         "ok": True,
         "symbol": sym,
         "slug": slug,
         "window_start": start,
+        "count": len(trades),
         "totals": {"Up": round(totals["Up"], 2), "Down": round(totals["Down"], 2)},
         "wallets": top,
-        "trades": trades[:100],
+        "trades": trades[:500],
     }
     _trades_cache[slug] = (now, payload)
     if len(_trades_cache) > 40:
