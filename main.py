@@ -333,6 +333,7 @@ async def price_loop():
                                 h["result"] = "win" if predicted == actual else "loss"
                                 h["final"] = final
                                 h["actual"] = actual
+                                h["move"] = round(final - open_p, 6)
                                 break
 
                     if ws.window_start is None or ws.window_start != window_start:
@@ -660,7 +661,8 @@ function render(d){
       const res=e.result==="win"?"✓":e.result==="loss"?"✗":"";
       const rc=e.result==="win"?"pos":e.result==="loss"?"neg":"";
       const sc=e.score?` ${e.score}/3`:"";
-      x+=`<div class="hrow"><div>${t}</div><div>${e.symbol||"—"}</div><div style="color:${e.side==="UP"?"var(--up)":"var(--down)"}">${e.side==="UP"?"↑":"↓"}</div><div>${(e.confidence*100).toFixed(0)}%${sc}</div><div class="${e.lead_bps>=0?"pos":"neg"}">${e.lead_bps>=0?"+":""}${e.lead_bps} <span class="${rc}">${res}</span></div></div>`;
+      const mv=e.move==null?null:e.move;
+      x+=`<div class="hrow"><div>${t}</div><div>${e.symbol||"—"}</div><div style="color:${e.side==="UP"?"var(--up)":"var(--down)"}">${e.side==="UP"?"↑":"↓"}</div><div>${(e.confidence*100).toFixed(0)}%${sc}</div><div class="${mv==null?"":mv>=0?"pos":"neg"}">${mv==null?"…":(mv>=0?"+":"-")+Math.abs(mv).toFixed(e.symbol==='XRP'?4:2)} <span class="${rc}">${res}</span></div></div>`;
     }
     document.getElementById("hist").innerHTML=x;
   }
