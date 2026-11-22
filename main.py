@@ -1029,7 +1029,7 @@ async function refresh(){try{render(await(await fetch("/api/status")).json())}ca
         const d=await (await fetch('/api/clean?period='+per)).json();
         const rows=(d.rows||[]).filter(w=>w.losses<=tloss);
         let x='';
-        if(d.status==='loading'){x+="<div style='color:var(--muted);margin-bottom:8px'>Рахую… перевірено "+(d.progress||0)+" з "+(d.total||'?')+" гаманців (перший раз до хвилини)</div>"}
+        if(d.status==='loading'){x+="<div style='color:var(--muted);margin-bottom:8px'>Рахую… перевірено "+(d.progress||0)+" з "+(d.total||'?')+" гаманців (перший раз може тривати 1–3 хв)</div>"}
         if(d.status==='error'){x+="<div style='color:var(--down);margin-bottom:8px'>"+esc(d.error||'Помилка')+"</div>"}
         for(const w of rows){
           const c=w.pnl>=0?'var(--up)':'var(--down)';
@@ -1510,7 +1510,8 @@ async def api_paper_reset(request):
 _clean: Dict[str, dict] = {}
 CLEAN_CANDIDATES = 40       # how many top-profit crypto wallets we check
 CLEAN_MIN_POSITIONS = 5     # ignore wallets with fewer closed positions in the period
-CLEAN_MAX_PAGES = 3         # pages per wallet and status (500 rows each); beyond that the data is "incomplete"
+CLEAN_MAX_PAGES = 6         # pages per wallet and status (200 rows each); beyond that the data is "incomplete"
+CLEAN_WALLET_TIMEOUT = 45   # seconds per wallet; slower ones are skipped
 CLEAN_TTL = 600
 _UPDOWN_RE = re.compile(r"(btc|eth|sol|xrp)-updown-5m-")
 
@@ -1582,7 +1583,7 @@ async def _wallet_window_stats(c: httpx.AsyncClient, wallet: str, since_ts: int)
                 params = {"user": wallet, "cursor": cursor}
             else:
                 params = {"user": wallet, "status": status, "sort_by": "TIMESTAMP",
-                          "sort_direction": "DESC", "limit": 500}
+                          "sort_direction": "DESC", "limit": 200}
             r = await c.get("https://data-api.polymarket.com/v2/positions", params=params)
             if r.status_code != 200:
                 return None
@@ -1641,7 +1642,8 @@ async def _clean_compute(period: str):
                 st["error"] = f"Не вдалося отримати кандидатів: {err}"
                 return
             st["total"] = len(cands)
-            sem = asyncio.Semaphore(6)
+            sem = asyncio.Semaphore(10)
+            logger.info(f"clean[{period}]: checking {len(cands)} wallets")
             results = []
             incomplete = 0
             failed = 0
@@ -1651,11 +1653,13 @@ async def _clean_compute(period: str):
                 nonlocal incomplete, failed, scope_all
                 async with sem:
                     try:
-                        res = await _wallet_window_stats(c, cd["wallet"], since)
+                        res = await asyncio.wait_for(_wallet_window_stats(c, cd["wallet"], since), CLEAN_WALLET_TIMEOUT)
                     except Exception as e:
                         logger.warning(f"clean stats {cd['wallet'][:8]}: {e}")
                         res = None
                 st["progress"] += 1
+                if st["progress"] % 10 == 0:
+                    logger.info(f"clean[{period}]: {st['progress']}/{len(cands)} done")
                 if res is None:
                     failed += 1
                     return
