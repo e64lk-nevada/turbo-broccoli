@@ -61,10 +61,14 @@ class WindowState:
         self.source: str = ""
         self.open_confirmed: bool = False  # True when open taken from Polymarket
         self.series: deque = deque(maxlen=400)  # (seconds_in_window, price) for chart
+        self.early: Optional[dict] = None       # early (low-confidence) forecast made right at window start
+        self.prev_tail: list = []                # last prices of the previous window (trend before the start)
 
     def reset(self, price: float, start: datetime, source: str = ""):
         self.price_to_beat = price
         self.window_start = start
+        self.prev_tail = list(self.prices)[-25:]
+        self.early = None
         self.prices.clear()
         self.prices.append(price)
         self.series.clear()
@@ -80,6 +84,7 @@ class WindowState:
 
 state: Dict[str, WindowState] = {s: WindowState(s) for s in SYMBOLS}
 signal_history: List[dict] = []
+early_history: List[dict] = []   # results of early forecasts (tracked separately from real signals)
 global_error: Optional[str] = None
 live_chainlink: Dict[str, float] = {}  # symbol -> last chainlink price
 
@@ -608,6 +613,22 @@ async def price_loop():
                                 h["move"] = round(final - open_p, 6)
                                 break
 
+                    if (ws.window_start is not None and ws.window_start != window_start
+                            and ws.early and ws.early.get("side") and ws.price_to_beat and ws.last_price):
+                        try:
+                            fin = await fetch_polymarket_close(client, symbol, int(ws.window_start.timestamp()))
+                            if fin is None:
+                                fin = twap_final_minute(ws.series) or ws.last_price
+                            act = "UP" if fin >= ws.price_to_beat else "DOWN"
+                            early_history.insert(0, {
+                                "symbol": symbol.replace("USDT", ""), "side": ws.early["side"], "actual": act,
+                                "result": "win" if ws.early["side"] == act else "loss",
+                                "time": ws.early["time"], "move": round(fin - ws.price_to_beat, 6),
+                            })
+                            del early_history[300:]
+                        except Exception as e:
+                            logger.warning(f"early eval error: {e}")
+
                     if ws.window_start is None or ws.window_start != window_start:
                         await paper_settle_orphans(client, symbol, start_unix)
                         # capture open from Chainlink if available, else binance
@@ -634,6 +655,18 @@ async def price_loop():
                     # update live
                     ws.prices.append(price)
                     ws.last_price = price
+
+                    # early forecast: trend of the last ~25 ticks (incl. the end of the previous window)
+                    if ws.early is None and seconds_passed >= 3:
+                        seq = list(ws.prev_tail) + list(ws.prices)
+                        side_e, mom_e = None, 0.0
+                        if len(seq) >= 12:
+                            ref = seq[-min(len(seq), 25)]
+                            mom_e = (seq[-1] - ref) / ref * 10000
+                            if abs(mom_e) >= 0.5:
+                                side_e = "UP" if mom_e > 0 else "DOWN"
+                        ws.early = {"side": side_e, "mom_bps": round(mom_e, 2),
+                                    "time": datetime.now(timezone.utc).isoformat()}
                     ws.series.append((round((datetime.now(timezone.utc) - ws.window_start).total_seconds(), 1), price))
                     ws.last_update = datetime.now(timezone.utc)
                     if source_now == "chainlink" and ws.source != "chainlink" and not ws.open_confirmed:
@@ -699,6 +732,7 @@ async def api_status(request):
             "live_side": live.get("side"),
             "live_confidence": live.get("confidence", 0),
             "live_score": live.get("score", 0),
+            "early": ws.early,
             "source": ws.source,
             "series": [[t, round(p, 4)] for t, p in ws.series],
             "twap60": (round(twap_last_seconds(ws.series), 4) if ws.series else None),
@@ -722,6 +756,10 @@ async def api_status(request):
         "chainlink_live": {k.replace("USDT",""): v for k,v in live_chainlink.items()},
         "markets": markets,
         "history": signal_history[:30],
+        "early_stats": {
+            "wins": sum(1 for e in early_history if e["result"] == "win"),
+            "losses": sum(1 for e in early_history if e["result"] == "loss"),
+        },
         "stats": {
             "signals": len(signal_history),
             "resolved": total_r,
@@ -949,9 +987,13 @@ function render(d){
       sh=`<span class="bs ${s==="UP"?"bu":"bd"}">${s==="UP"?"ВГОРУ":"ВНИЗ"} ${(m.signal.confidence*100).toFixed(0)}%${sc}</span>`;
     }else if(d.seconds_passed>=d.confirm_at&&m.live_side){
       sh=`<span class="bs bw">${m.live_side} ~${(m.live_confidence*100).toFixed(0)}%</span>`;
+    }else if(m.early&&m.early.side){
+      sh=`<span class="bs bw" title="ранній прогноз, низька впевненість">ранній ${m.early.side==="UP"?"↑":"↓"}</span>`;
     }
     body+=`<div class="mrow"><div style="font-weight:600">${n}</div><div>${f(m.open,n==="XRP"?4:2)}</div><div>${f(m.current,n==="XRP"?4:2)}</div><div>${sh}</div></div>`;
   }
+  const es=d.early_stats||{wins:0,losses:0},et=es.wins+es.losses;
+  body+=`<div style="font-size:.74rem;color:var(--muted);margin-top:10px;line-height:1.4">Ранній прогноз (одразу на старті вікна, низька впевненість, окрема статистика): <b>${es.wins}</b> / <b>${es.losses}</b>${et?` · ${(es.wins/et*100).toFixed(0)}%`:""}</div>`;
   document.getElementById("mkt").innerHTML=body;
   const st=d.stats||{};
   if(st.win_rate!=null){
